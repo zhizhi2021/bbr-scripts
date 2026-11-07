@@ -3,7 +3,7 @@
 # Algorithm references: https://github.com/google/bbr
 # No remote shell execution, automatic reboot, or kernel removal.
 
-VERSION=1.1.0
+VERSION=1.1.1
 STATE_DIR=/var/lib/bbr-script
 CONFIG=/etc/sysctl.d/99-zz-bbr-script.conf
 LOG=/var/log/bbr-script.log
@@ -14,7 +14,7 @@ REVERSE=0 COMPARE=0 ALGORITHM=bbr
 OS_ID=unknown OS_VERSION=unknown ARCH=unknown VIRT=unknown
 SUPPORTED=0
 TX_ACTIVE=0 TX_DIR=''
-AUTO=0 SUITE=0 QUEUE_EXPLICIT=0 STREAMS_EXPLICIT=0
+AUTO=0 SUITE=0 QUEUE_EXPLICIT=0 STREAMS_EXPLICIT=0 ALGORITHM_EXPLICIT=0
 BEFORE='' AFTER='' DEVICE_JSON='' DEVICE_QUEUE=fq DEVICE_BUDGET=0 DEVICE_STREAMS=1
 
 say() { printf '%s\n' "$*"; }
@@ -37,7 +37,7 @@ BBR 管理工具：检测、预演、启用和恢复；不会自动重启。
   recovery                只读恢复与排障中心
   compare --before 目录 --after 目录
                           比较相同条件下保存的两组测速结果
-  menu                    中文交互菜单
+  menu                    简洁首页：1 设备启用 / 2 状态 / 3 测速 / 4 恢复 / 5 全部高级功能
 选项：
   --auto                  均衡设备建议；手动参数优先，队列预算仅用于 queue
   --suite                 单连接与设备建议并发分别测试，需自备 iperf3 服务端
@@ -128,8 +128,8 @@ confirm() {
     (( YES )) && return 0
     [[ -t 0 ]] || { fail '非交互修改需要 --yes；先使用 --dry-run 查看。'; return 1; }
     local reply
-    read -r -p '输入 yes 确认修改：' reply
-    [[ $reply == yes ]] || { fail '已取消。'; return 1; }
+    read -r -p '确认应用？[y/N]：' reply || { warn '已取消。'; return 1; }
+    case $reply in y|Y|yes|YES|Yes) return 0 ;; *) warn '已取消。'; return 1 ;; esac
 }
 validate_platform() {
     local mode=${1:-write}
@@ -164,7 +164,7 @@ parse_args() {
                 case $opt in
                     --host) HOST=$2 ;; --interface) IFACE=$2 ;; --qdisc) QUEUE=$2; QUEUE_EXPLICIT=1 ;;
                     --port) PORT=$2 ;; --duration) DURATION=$2 ;; --parallel) STREAMS=$2; STREAMS_EXPLICIT=1 ;;
-                    --algorithm) ALGORITHM=$2 ;; --channel) CHANNEL=$2 ;;
+                    --algorithm) ALGORITHM=$2; ALGORITHM_EXPLICIT=1 ;; --channel) CHANNEL=$2 ;;
                     --before) BEFORE=$2 ;; --after) AFTER=$2 ;;
                 esac
                 shift ;;
@@ -421,7 +421,7 @@ ui_overview() {
     printf '%sBBR 管理工具 v%s%s\n' "$UI_BOLD" "$VERSION" "$UI_RESET"
     say "系统：$OS_ID $OS_VERSION / $ARCH   内核：$(uname -r)"
     say "默认 TCP：${CURRENT_CC:-未知}   默认队列：${CURRENT_QDISC:-未知}"
-    say '实际网卡队列与连接算法可在「状态详情 / 诊断」查看。'
+    say '网卡队列与连接详情见状态；完整诊断和手动参数见高级设置。'
     if (( DRY_RUN )); then say '运行模式：预演，不修改系统、不发起测速'
     elif [[ $VIRT == container* ]]; then say '运行模式：容器，不能修改系统；可诊断、预演和测速'
     elif (( ! SUPPORTED )); then say '运行模式：此系统不在适配名单；可诊断、预演和测速'
@@ -431,9 +431,9 @@ ui_overview() {
         say '备份与恢复记录：当前用户无读取权限'
     else
         [[ ! -d $STATE_DIR/baseline ]] || say '原配置备份：可恢复'
-        [[ ! -d $STATE_DIR/transaction ]] || say '待处理：配置事务中断，请进入「恢复原配置」'
-        [[ ! -d $STATE_DIR/queue.pending ]] || say '待处理：队列事务中断，请进入「队列管理 → 恢复」'
-        [[ ! -d $STATE_DIR/kernel.pending ]] || say '待处理：内核事务中断，请进入「内核管理 → 启动项恢复」'
+        [[ ! -d $STATE_DIR/transaction ]] || say '待处理：配置事务中断，请进入「恢复与排障 → 原 BBR 配置」'
+        [[ ! -d $STATE_DIR/queue.pending ]] || say '待处理：队列事务中断，请进入「恢复与排障 → 原网卡队列」'
+        [[ ! -d $STATE_DIR/kernel.pending ]] || say '待处理：内核事务中断，请进入「恢复与排障 → 内核启动项」'
     fi
     printf '%s------------------------------------------------------------%s\n' "$UI_CYAN" "$UI_RESET"
 }
@@ -482,6 +482,23 @@ ui_kernel_menu() {
         ui_run '内核操作' kernel_command || :
     done
 }
+ui_default_interface() {
+    has ip && has python3 || return 1
+    ip -j route show default 2>/dev/null | python3 -c 'import json,sys,re
+try:
+ routes=json.load(sys.stdin)
+ names=set()
+ for r in routes:
+  if r.get("dev"):names.add(r["dev"])
+  for hop in r.get("nexthops",[]):
+   if hop.get("dev"):names.add(hop["dev"])
+ if len(names)!=1:sys.exit(1)
+ name=next(iter(names))
+ if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,14}",name) or name=="lo":sys.exit(1)
+ print(name)
+except (ValueError,TypeError,AttributeError):sys.exit(1)'
+}
+
 ui_list_interfaces() {
     say '当前可见网卡：'
     if has ip; then
@@ -489,9 +506,11 @@ ui_list_interfaces() {
     else warn '缺少 ip，可手动输入；实际修改需要 iproute2。'; fi
 }
 ui_select_queue() {
+    local default=1
+    case $QUEUE in fq_codel) default=2 ;; cake) default=3 ;; esac
     while :; do
         say '  1  fq（BBR 常用搭配）  2  fq_codel  3  cake  0  返回'
-        ui_read '选择队列' 1 || return 1
+        ui_read '选择队列' "$default" || return 1
         case $UI_INPUT in
             1) QUEUE=fq; QUEUE_EXPLICIT=1; return 0 ;; 2) QUEUE=fq_codel; QUEUE_EXPLICIT=1; return 0 ;; 3) QUEUE=cake; QUEUE_EXPLICIT=1; return 0 ;;
             0|q|Q) return 1 ;; *) warn '无效选择，请输入 0-3。' ;;
@@ -509,6 +528,7 @@ ui_queue_menu() {
             0|q|Q) return 0 ;;
             1) ui_run '实际网卡队列' inspect_qdiscs || : ;;
             2) ui_list_interfaces
+               [[ -n $IFACE ]] || IFACE=$(ui_default_interface 2>/dev/null || :)
                ui_ask IFACE '网卡名称' interface "$IFACE" || continue
                ui_select_queue || continue
                say "将尝试把 $IFACE 的简单根队列更换为 $QUEUE，并保存恢复记录。"
@@ -519,14 +539,14 @@ ui_queue_menu() {
         esac
     done
 }
-ui_benchmark_menu() {
+ui_benchmark_custom() {
     local HOST=$HOST PORT=$PORT DURATION=$DURATION STREAMS=$STREAMS
     local REVERSE=0 COMPARE=0 ALGORITHM=$ALGORITHM SUITE=0 STREAMS_EXPLICIT=$STREAMS_EXPLICIT
     ui_heading '性能测试'
     say '需要已获授权的 iperf3 服务端；会产生真实流量，结果取决于测试路径。'
     detect_capabilities
     say "当前可用算法：${AVAILABLE:-无法读取}；对比模式需同时支持 cubic 和 bbr。"
-    ui_ask HOST '服务端 IP 或域名' host "$HOST" || return 0
+    if [[ ${1:-} != host-ready ]]; then ui_ask HOST '服务端 IP 或域名' host "$HOST" || return 0; fi
     ui_ask PORT '端口 1-65535' port "$PORT" || return 0
     ui_ask DURATION '每轮时长 1-120 秒' duration "$DURATION" || return 0
     ui_ask STREAMS '并发流数 1-16' parallel "$STREAMS" || return 0
@@ -554,39 +574,107 @@ ui_benchmark_menu() {
     case $UI_INPUT in q|Q) return 0 ;; '') ;; *) warn '未开始测试，请重新选择。'; return 0 ;; esac
     ui_run '性能测试' run_benchmark || :
 }
+ui_quick_enable() {
+    local AUTO=1 QUEUE=$QUEUE QUEUE_EXPLICIT=$QUEUE_EXPLICIT
+    ui_run '按设备建议启用 BBR' enable_bbr
+}
+ui_manual_enable() {
+    local AUTO=0 QUEUE=$QUEUE QUEUE_EXPLICIT=1
+    ui_heading '手动 BBR 配置'
+    ui_select_queue || return 0
+    ui_run '启用手动 BBR 配置' enable_bbr
+}
+ui_benchmark_menu() {
+    local HOST=$HOST PORT=$PORT DURATION=$DURATION STREAMS=$STREAMS
+    local AUTO=1 SUITE=1 REVERSE=0 COMPARE=0 ALGORITHM=$ALGORITHM
+    local STREAMS_EXPLICIT=$STREAMS_EXPLICIT recommended=1
+    detect_capabilities
+    if (( ! ALGORITHM_EXPLICIT )) && valid_value "$CURRENT_CC" && contains_word "$AVAILABLE" "$CURRENT_CC"; then ALGORITHM=$CURRENT_CC; fi
+    ui_heading '测速'
+    ui_ask HOST 'iperf3 服务端 IP 或域名' host "$HOST" || return 0
+    if load_device_resources; then
+        recommended=$DEVICE_STREAMS
+        (( STREAMS_EXPLICIT )) || STREAMS=$recommended
+    else
+        warn '设备信息不完整，快捷测试使用单组参数；仍可选择自定义。'
+        AUTO=0; SUITE=0
+        (( STREAMS_EXPLICIT )) || STREAMS=1
+    fi
+    while :; do
+        if (( SUITE && STREAMS > 1 )); then
+            say "默认：单连接 + $STREAMS 流两轮，每轮 ${DURATION}s，端口 $PORT，算法 $ALGORITHM。"
+        else say "默认：并发 $STREAMS，每轮 ${DURATION}s，端口 $PORT，算法 $ALGORITHM。"; fi
+        say '会产生真实流量；a 可调整端口、时长、算法、方向、并发和测试模式。'
+        ui_read '回车开始 / a 自定义 / q 返回' || return 0
+        case $UI_INPUT in
+            '') ui_run '测速' run_benchmark || :; return 0 ;;
+            a|A) ui_benchmark_custom host-ready; return $? ;;
+            q|Q|0) return 0 ;;
+            *) warn '无效选择，请回车开始，或输入 a / q。' ;;
+        esac
+    done
+}
+ui_recovery_menu() {
+    local ACTION='' CHANNEL=distro
+    while :; do
+        ui_heading '恢复与排障'
+        recovery_center || :
+        say '  1  恢复原 BBR 配置'
+        say '  2  恢复原网卡队列'
+        say '  3  恢复内核启动项'
+        say '  0  返回'
+        ui_read '请选择 [0-3]' || return 0
+        case $UI_INPUT in
+            0|q|Q) return 0 ;;
+            1) ui_run '恢复原 BBR 配置' restore_state || : ;;
+            2) ui_run '恢复原网卡队列' restore_queue || : ;;
+            3) ACTION=recover; ui_run '恢复内核启动项' kernel_command || : ;;
+            *) warn '无效选择，请输入 0-3。' ;;
+        esac
+    done
+}
+ui_advanced_menu() {
+    while :; do
+        ui_heading '高级设置'
+        say '  1  手动 BBR 配置       2  完整诊断'
+        say '  3  内核管理           4  网卡队列管理'
+        say '  5  设备方案详情       6  仅预演 BBR 配置'
+        say '  7  全部命令行用法     8  比较历史测速结果'
+        say '  0  返回'
+        ui_read '请选择 [0-8]' || return 0
+        case $UI_INPUT in
+            0|q|Q) return 0 ;;
+            1) ui_manual_enable || : ;;
+            2) ui_run '完整诊断' doctor || : ;;
+            3) ui_kernel_menu ;;
+            4) ui_queue_menu ;;
+            5) ui_device_menu || : ;;
+            6) ui_preview || : ;;
+            7) ui_run '全部命令行用法' usage || : ;;
+            8) ui_compare_results ;;
+            *) warn '无效选择，请输入 0-8。' ;;
+        esac
+    done
+}
 menu() {
     while :; do
         ui_overview
-        say '  查看'
-        say '    1  状态详情             2  连接与环境诊断'
-        say '  配置'
-        say "    3  启用原生 BBR + $QUEUE    4  恢复原配置"
-        say '  高级'
-        say '    5  内核管理             6  队列管理'
-        say '    7  性能测试             8  预演 BBR 配置'
-        say '    9  命令行帮助           r  刷新状态'
-        say '   10  设备自适应方案      11  恢复与排障中心'
-        say '   12  比较保存的测速结果'
-        say '    0  退出'
-        ui_read '请选择 [0-12 / r]' || { say ''; return 0; }
+        say '  1  一键按设备启用 BBR（推荐）'
+        say '  2  查看状态'
+        say '  3  测速'
+        say '  4  恢复与排障'
+        say '  5  高级设置（全部功能）'
+        say '  0  退出       r  刷新'
+        ui_read '请选择 [0-5 / r]' || { say ''; return 0; }
         case $UI_INPUT in
             0|q|Q) say '已退出。'; return 0 ;;
-            1) ui_run '状态详情' show_status || : ;;
-            2) ui_run '连接与环境诊断' doctor || : ;;
-            3) say "将设置新连接默认 bbr、默认队列 $QUEUE；备份原状态，不更换当前网卡队列、不重启。"
-               ui_run '启用原生 BBR' enable_bbr || : ;;
-            4) say '恢复首次启用前的配置与运行参数；检测到后续人工修改时会停止。'
-               ui_run '恢复原配置' restore_state || : ;;
-            5) ui_kernel_menu ;;
-            6) ui_queue_menu ;;
-            7) ui_benchmark_menu ;;
-            8) ui_preview || : ;;
-            9) ui_run '命令行帮助' usage || : ;;
-            10) ui_device_menu || : ;;
-            11) ui_run '恢复与排障中心' recovery_center || : ;;
-            12) ui_compare_results ;;
+            1) ui_quick_enable || : ;;
+            2) ui_run '状态详情' show_status || : ;;
+            3) ui_benchmark_menu ;;
+            4) ui_recovery_menu ;;
+            5) ui_advanced_menu ;;
             r|R) continue ;;
-            *) warn '无效选择，请输入 0-12，或 r 刷新。' ;;
+            *) warn '无效选择，请输入 0-5，或 r 刷新。' ;;
         esac
     done
 }
