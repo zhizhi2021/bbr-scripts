@@ -61,12 +61,20 @@ bash bbr.sh menu
 | 下载 | `curl` |
 | 运行参数与修改锁 | `sysctl`（procps）、`flock`（util-linux） |
 | 设备分析、JSON、连接检查、结果比较 | Python 3 |
-| 网卡与队列 | `ip`、`tc`（iproute2），`unshare`（util-linux） |
+| 网卡与队列 | `ip`、`tc`（Debian: iproute2；Rocky/Alma: iproute-tc），`unshare`（util-linux） |
 | 按需加载内核模块 | `modprobe`（kmod）；已内置或注册的能力不强制依赖模块文件 |
 | 测速 | iperf3、`timeout`（coreutils） |
 | 内核安装 | 发行版包管理器、官方签名信任及脚本支持的启动环境 |
 
-缺少工具时使用系统包管理器按需安装。脚本不会通过关闭 TLS 或包签名验证解决安装问题。
+从 v1.1.2 起，交互菜单、配置修改和测速会先检查所需工具，以 root 身份通过系统包管理器自动安装缺失项，再继续操作。例如选择“按设备建议启用 BBR”时，缺少 Python 3 会自动安装，无需手动退出处理。Debian/Ubuntu 使用 APT，Rocky/AlmaLinux 使用 DNF；不添加软件源，不安装内核或启动器，不自动重启，也不会关闭 TLS 或包签名验证。
+
+只读 CLI 命令与 `--dry-run` 不安装软件。可以提前一次补齐所有运行依赖：
+
+```bash
+bash bbr.sh install-deps
+```
+
+添加 `--no-install` 可禁止自动安装。非 root 用户、软件源不可用或安装后工具仍缺失时，会明确报错并停止依赖该工具的操作。下载脚本所需的 Bash 和 curl 需由系统预先提供。
 
 ## 常用命令
 

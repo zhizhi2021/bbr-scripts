@@ -3,12 +3,12 @@
 # Algorithm references: https://github.com/google/bbr
 # No remote shell execution, automatic reboot, or kernel removal.
 
-VERSION=1.1.1
+VERSION=1.1.2
 STATE_DIR=/var/lib/bbr-script
 CONFIG=/etc/sysctl.d/99-zz-bbr-script.conf
 LOG=/var/log/bbr-script.log
 OS_RELEASE=/etc/os-release
-DRY_RUN=0 YES=0
+DRY_RUN=0 YES=0 AUTO_INSTALL=1
 COMMAND='' ACTION='' HOST='' IFACE='' QUEUE=fq PORT=5201 DURATION=10 STREAMS=1
 REVERSE=0 COMPARE=0 ALGORITHM=bbr
 OS_ID=unknown OS_VERSION=unknown ARCH=unknown VIRT=unknown
@@ -24,6 +24,7 @@ usage() {
     cat <<'HELP'
 BBR 管理工具：检测、预演、启用和恢复；不会自动重启。
 用法：bash bbr.sh <命令> [选项]
+  install-deps            安装运行依赖（不安装内核或启动器）
   status / doctor         查看系统、算法、队列和连接诊断
   enable                  启用当前内核 BBR，默认队列 fq
   disable                 恢复第一次 enable 前的状态（与 restore 相同）
@@ -42,6 +43,7 @@ BBR 管理工具：检测、预演、启用和恢复；不会自动重启。
   --auto                  均衡设备建议；手动参数优先，队列预算仅用于 queue
   --suite                 单连接与设备建议并发分别测试，需自备 iperf3 服务端
   --dry-run               仅预演，不写文件、不加载模块、不发起测速
+  --no-install            禁止按需自动安装缺少的依赖
   --yes                   确认修改；默认需要终端确认
   --qdisc fq|fq_codel|cake 队列选择（enable 仅设置默认，不替换现有队列）
   --port 1..65535         iperf3 端口，默认 5201
@@ -64,6 +66,72 @@ HELP
 }
 
 has() { command -v "$1" >/dev/null 2>&1; }
+# Keep installation outside JSON-producing device probes.
+dependency_can_install() { (( EUID == 0 )); }
+dependency_manager() {
+    local key value id=''
+    while IFS='=' read -r key value; do
+        [[ $key == ID ]] || continue
+        value=${value#\"}; value=${value%\"}; value=${value#\'}; value=${value%\'}
+        id=$value; break
+    done < "$OS_RELEASE"
+    case $id in
+        debian|ubuntu) has apt-get && printf 'apt\n' ;;
+        rocky|almalinux) has dnf && printf 'dnf\n' ;;
+        *) fail '无法自动安装：此发行版未配置支持的包管理器'; return 1 ;;
+    esac
+}
+install_runtime_packages() {
+    local manager=$1; shift
+    case $manager in
+        apt)
+            local -a opts=(-o APT::Get::AllowUnauthenticated=false -o Acquire::AllowInsecureRepositories=false
+                -o Acquire::https::Verify-Peer=true -o Acquire::https::Verify-Host=true
+                -o DPkg::Lock::Timeout=60 -o Acquire::Retries=2)
+            DEBIAN_FRONTEND=noninteractive apt-get "${opts[@]}" update >&2 || return $?
+            DEBIAN_FRONTEND=noninteractive apt-get "${opts[@]}" -o Dpkg::Options::=--force-confdef \
+                -o Dpkg::Options::=--force-confold install --yes --no-remove --no-install-recommends "$@" >&2 ;;
+        dnf)
+            dnf --assumeyes --setopt=gpgcheck=1 --setopt='*.gpgcheck=1' \
+                --setopt=sslverify=1 --setopt='*.sslverify=1' --setopt=install_weak_deps=False install "$@" >&2 ;;
+        *) fail '未知包管理器'; return 1 ;;
+    esac
+}
+ensure_dependencies() {
+    local tool manager package present rc
+    local -a missing=() packages=()
+    for tool in "$@"; do has "$tool" || missing+=("$tool"); done
+    (( ${#missing[@]} )) || return 0
+    if (( DRY_RUN )); then fail "预演不安装依赖；缺少：${missing[*]}。请先运行 install-deps"; return 1; fi
+    (( AUTO_INSTALL )) || { fail "自动安装已关闭；缺少：${missing[*]}"; return 1; }
+    dependency_can_install || { fail "自动安装缺少的依赖需要 root：${missing[*]}"; return 1; }
+    manager=$(dependency_manager) || return 1
+    for tool in "${missing[@]}"; do
+        case $tool in
+            python3|iperf3|grep|sed) package=$tool ;;
+            sysctl) if [[ $manager == apt ]]; then package=procps; else package=procps-ng; fi ;;
+            ip|tc)
+                if [[ $manager == apt ]]; then package=iproute2
+                elif [[ $tool == tc ]]; then package=iproute-tc
+                else package=iproute; fi ;;
+            flock|unshare|setsid) package=util-linux ;;
+            modprobe) package=kmod ;;
+            awk) package=gawk ;; cmp) package=diffutils ;;
+            timeout|stat|mktemp|date|head|cat|cp|mv|chmod|sync|rm|mkdir|rmdir|uname|df|readlink) package=coreutils ;;
+            *) fail "没有工具 $tool 的可信包映射"; return 1 ;;
+        esac
+        present=0
+        for rc in "${packages[@]}"; do [[ $rc != "$package" ]] || present=1; done
+        (( present )) || packages+=("$package")
+    done
+    warn "正在通过系统包管理器安装缺少的依赖：${missing[*]}"
+    install_runtime_packages "$manager" "${packages[@]}" || { rc=$?; fail '依赖安装失败，请检查软件源、网络及包管理器状态后重试'; return "$rc"; }
+    hash -r
+    for tool in "${missing[@]}"; do has "$tool" || { fail "安装后仍缺少 $tool"; return 1; }; done
+}
+install_dependencies() {
+    ensure_dependencies python3 sysctl ip tc flock unshare setsid modprobe awk cmp grep sed timeout stat mktemp date head cat cp mv chmod sync rm mkdir rmdir uname df readlink iperf3
+}
 read_os_field() {
     awk -F= -v key="$1" '$1==key {v=substr($0,index($0,"=")+1); gsub(/^"|"$/, "", v); gsub(/^\047|\047$/, "", v); print v; exit}' "$OS_RELEASE"
 }
@@ -152,6 +220,7 @@ parse_args() {
             --help|-h) usage; return 10 ;;
             --version) say "$VERSION"; return 10 ;;
             --dry-run) DRY_RUN=1 ;;
+            --no-install) AUTO_INSTALL=0 ;;
             --yes|-y) YES=1 ;;
             --auto) AUTO=1; scoped+=(--auto) ;;
             --suite) SUITE=1; scoped+=(--suite) ;;
@@ -176,7 +245,7 @@ parse_args() {
         esac
         shift
     done
-    case $COMMAND in ''|status|doctor|enable|disable|restore|queue|queue-restore|kernel|benchmark|menu|profile|plan|recovery|compare) ;; *) fail "未知命令：$COMMAND"; return 2 ;; esac
+    case $COMMAND in ''|install-deps|status|doctor|enable|disable|restore|queue|queue-restore|kernel|benchmark|menu|profile|plan|recovery|compare) ;; *) fail "未知命令：$COMMAND"; return 2 ;; esac
     case $QUEUE in fq|fq_codel|cake) ;; *) fail '不支持的队列'; return 2 ;; esac
     case $CHANNEL in distro|bbr3) ;; *) fail '不支持的内核通道'; return 2 ;; esac
     [[ $ALGORITHM =~ ^[a-zA-Z0-9_]{1,32}$ ]] || { fail '算法名称不合法'; return 2; }
@@ -359,6 +428,7 @@ recovery_center() {
 }
 ui_device_menu() {
     local AUTO=1 QUEUE=$QUEUE QUEUE_EXPLICIT=$QUEUE_EXPLICIT
+    ensure_dependencies python3 || return $?
     while :; do
         ui_heading '设备自适应（均衡稳定）'
         show_change_plan || { ui_pause; return 1; }
@@ -592,6 +662,7 @@ ui_benchmark_menu() {
     if (( ! ALGORITHM_EXPLICIT )) && valid_value "$CURRENT_CC" && contains_word "$AVAILABLE" "$CURRENT_CC"; then ALGORITHM=$CURRENT_CC; fi
     ui_heading '测速'
     ui_ask HOST 'iperf3 服务端 IP 或域名' host "$HOST" || return 0
+    ensure_dependencies python3 || return $?
     if load_device_resources; then
         recommended=$DEVICE_STREAMS
         (( STREAMS_EXPLICIT )) || STREAMS=$recommended
@@ -749,7 +820,7 @@ read_pair() {
 ensure_modules() {
     detect_capabilities
     if ! contains_word "$AVAILABLE" bbr; then
-        has modprobe || { fail '缺少 modprobe（kmod），且 bbr 未注册。'; return 1; }
+        ensure_dependencies modprobe || return $?
         modprobe tcp_bbr || { fail '无法加载 tcp_bbr，当前内核可能不支持。'; return 1; }
         detect_capabilities
         contains_word "$AVAILABLE" bbr || { fail '加载后仍没有 bbr'; return 1; }
@@ -770,6 +841,10 @@ ensure_queue_module() {
         if [[ -r $config ]] && grep -qx "$option=y" "$config"; then return 0; fi
     done
     if [[ -r /proc/config.gz ]] && has zgrep && zgrep -qx "$option=y" /proc/config.gz; then return 0; fi
+    if ! has modprobe; then
+        ensure_dependencies modprobe || return $?
+        modprobe "sch_$QUEUE" 2>/dev/null && return 0
+    fi
     fail "不能确认 $QUEUE 已注册、内置或可加载；请安装当前内核的匹配模块。"
 }
 
@@ -959,6 +1034,8 @@ finish_transaction() {
 }
 enable_bbr() ( enable_bbr_impl )
 enable_bbr_impl() {
+    ensure_dependencies sysctl flock awk stat mktemp cp mv chmod sync rm mkdir rmdir grep cmp date uname cat || return $?
+    if (( AUTO )); then ensure_dependencies python3 || return $?; fi
     apply_device_defaults || return 1
     detect_system; detect_capabilities
     if (( DRY_RUN )); then
@@ -991,6 +1068,7 @@ enable_bbr_impl() {
 restore_state() ( restore_state_impl )
 restore_state_impl() {
     if (( DRY_RUN )); then say "预演：检查并恢复 $STATE_DIR 中的原配置与运行参数；不会删除其他配置。"; return 0; fi
+    ensure_dependencies sysctl flock awk stat mktemp cp mv chmod sync rm mkdir rmdir grep cmp date uname cat || return $?
     detect_system; require_mutation recovery || return 1
     prepare_state && acquire_lock || return 1
     secure_path "$CONFIG" && secure_path "$LOG" || return 1
@@ -1238,6 +1316,7 @@ prepare_queue_target() {
 
 set_queue() ( set_queue_impl )
 set_queue_impl() {
+    ensure_dependencies python3 ip tc unshare flock || return $?
     [[ -n $IFACE ]] || { fail '请指定 --interface 网卡'; return 2; }
     apply_device_defaults || return 1
     if (( DRY_RUN )); then
@@ -1288,7 +1367,7 @@ restore_queue() ( restore_queue_impl )
 restore_queue_impl() {
     if (( DRY_RUN )); then say '预演：核对当前队列与快照，恢复此前简单根队列；不改变启动配置。'; return 0; fi
     detect_system; require_mutation recovery || return 1
-    if ! has python3 || ! has tc; then fail '需要 python3 和 tc'; return 1; fi
+    ensure_dependencies python3 tc || return $?
     prepare_state && acquire_lock || return 1
     local dir
     if [[ -d $STATE_DIR/queue.pending ]]; then dir="$STATE_DIR/queue.pending"
@@ -1535,6 +1614,7 @@ kernel_exit() {
 }
 kernel_recover() (
     if (( DRY_RUN )); then say '预演：从 kernel.pending 恢复安装前默认启动项，不卸载软件包。'; return 0; fi
+    ensure_dependencies sysctl flock awk stat mktemp cp mv chmod sync rm mkdir rmdir grep cmp date uname cat || return $?
     detect_system; require_mutation recovery || return 1
     prepare_state && acquire_lock || return 1
     recover_kernel_journal
@@ -1595,7 +1675,7 @@ running_kernel_pins() {
 kernel_install() ( kernel_install_impl )
 kernel_install_impl() {
     detect_system; require_mutation || return 1
-    has python3 || { fail '需要 python3 校验仓库配置'; return 1; }
+    ensure_dependencies python3 setsid || return $?
     prepare_state && acquire_lock || return 1
     [[ ! -e $STATE_DIR/kernel.pending ]] || { fail '存在未完成内核事务，请先 kernel recover'; return 1; }
     boot_preflight || return 1
@@ -1704,7 +1784,7 @@ run_benchmark_once() {
         say "预演：iperf3 TCP 主机 $HOST 端口 $PORT 时长 ${DURATION}s 并发 $STREAMS 算法 $ALGORITHM reverse=$REVERSE compare=$COMPARE。"
         say '不会连接服务端、加载模块或创建结果文件。'; return 0
     fi
-    if ! has iperf3 || ! has python3; then fail '需要 iperf3 与 python3；请用发行版包管理器安装。'; return 1; fi
+    ensure_dependencies iperf3 python3 timeout sysctl date uname head mktemp || return $?
     detect_capabilities
     local -a algorithms=("$ALGORITHM")
     (( COMPARE == 0 )) || algorithms=(cubic bbr)
@@ -1753,6 +1833,7 @@ run_benchmark() {
     (( SUITE )) || { run_benchmark_once; return $?; }
     [[ -n $HOST ]] || { fail '请指定 --host'; return 2; }
     (( REVERSE == 0 || COMPARE == 0 )) || { fail '反向模式不能使用 --compare'; return 2; }
+    ensure_dependencies python3 || return $?
     load_device_resources || return 1
     local pressure=$DEVICE_STREAMS rc=0 current=0
     (( ! STREAMS_EXPLICIT )) || pressure=$STREAMS
@@ -1842,7 +1923,18 @@ main() {
     (( rc == 10 )) && return 0
     (( rc == 0 )) || return "$rc"
     case $COMMAND in
+        enable|disable|restore|queue|queue-restore)
+            ensure_dependencies sysctl flock awk stat mktemp cp mv chmod sync rm mkdir rmdir grep cmp date uname cat sed df readlink || return $? ;;
+        kernel)
+            if [[ $ACTION == install || $ACTION == recover ]]; then
+                ensure_dependencies sysctl flock awk stat mktemp cp mv chmod sync rm mkdir rmdir grep cmp date uname cat sed df readlink || return $?
+            fi ;;
+        menu) ensure_dependencies python3 sysctl ip tc flock unshare awk stat mktemp cp mv chmod sync rm mkdir rmdir grep cmp date uname cat sed df readlink || return $? ;;
+        '') if [[ -t 0 ]]; then ensure_dependencies python3 sysctl ip tc flock unshare awk stat mktemp cp mv chmod sync rm mkdir rmdir grep cmp date uname cat sed df readlink || return $?; fi ;;
+    esac
+    case $COMMAND in
         '') if [[ -t 0 ]]; then menu; else usage; fi ;;
+        install-deps) install_dependencies ;;
         status) show_status ;; doctor) doctor ;; enable) enable_bbr ;;
         disable|restore) restore_state ;; queue) set_queue ;; queue-restore) restore_queue ;;
         kernel) kernel_command ;; benchmark) run_benchmark ;; menu) menu ;;
