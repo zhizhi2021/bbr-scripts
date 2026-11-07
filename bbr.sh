@@ -3,7 +3,7 @@
 # Algorithm references: https://github.com/google/bbr
 # No remote shell execution, automatic reboot, or kernel removal.
 
-VERSION=1.1.5
+VERSION=1.1.6
 STATE_DIR=/var/lib/bbr-script
 CONFIG=/etc/sysctl.d/99-zz-bbr-script.conf
 LOG=$STATE_DIR/bbr-script.log
@@ -178,20 +178,28 @@ inspect_qdiscs() {
 show_status() {
     local rc=0
     detect_system; detect_capabilities
-    say "BBR 管理工具 $VERSION"
-    say "系统：$OS_ID $OS_VERSION / $ARCH；虚拟化：$VIRT"
-    say "内核：$(uname -r)"
-    say "适配名单匹配：$SUPPORTED（名单核对 2026-11-07；不代表真机验证，后续版本需更新名单）"
-    say "可用拥塞算法：${AVAILABLE:-无法读取}"
-    say "运行默认算法：${CURRENT_CC:-无法读取}"
-    say "运行默认队列：${CURRENT_QDISC:-无法读取}"
-    say 'BBR 版本：未知；算法名不能证明 v1/v3，需核验内核来源。'
-    if [[ -r $CONFIG ]]; then say "持久配置：$CONFIG"; cat -- "$CONFIG" || rc=1
-    elif [[ -e $CONFIG || -L $CONFIG ]]; then say '持久配置：存在，但当前用户无读取权限或链接目标不可用'; rc=1
-    else say '持久配置：未由本脚本管理'; fi
+    ui_heading "系统状态 · v$VERSION"
+    ui_field '系统' "$OS_ID $OS_VERSION / $ARCH"
+    ui_field '虚拟化' "$VIRT"
+    ui_field '内核' "$(uname -r)"
+    if (( SUPPORTED )); then ui_field '适配名单' '匹配（仍需运行能力检查）'
+    else ui_field '适配名单' '未匹配（支持诊断与预演）'; fi
+    ui_heading '运行参数'
+    ui_field '可用算法' "${AVAILABLE:-无法读取}"
+    ui_field '默认算法' "${CURRENT_CC:-无法读取}"
+    ui_field '默认队列' "${CURRENT_QDISC:-无法读取}"
+    ui_field 'BBR 版本' '未知，需核验内核来源'
+    ui_heading '持久配置'
+    if [[ -r $CONFIG ]]; then ui_field '文件' "$CONFIG"; cat -- "$CONFIG" || rc=1
+    elif [[ -e $CONFIG || -L $CONFIG ]]; then ui_field '状态' '存在，但无读取权限或链接不可用'; rc=1
+    else ui_field '状态' '未由本脚本管理'; fi
     if [[ -z $AVAILABLE || -z $CURRENT_CC || -z $CURRENT_QDISC ]]; then warn '运行参数读取不完整，不能确认配置状态。'; rc=1; fi
-    say '实际网卡队列：'; inspect_qdiscs || rc=1
-    say '新建 socket 才采用新的默认算法；已有监听 socket 可能继续继承旧值。'
+    ui_heading '实际网卡队列'
+    inspect_qdiscs || rc=1
+    ui_heading '生效说明'
+    say '  新建 socket 才采用新的默认算法。'
+    say '  已有监听 socket 可能继续继承旧值。'
+    say '  名单核对：2026-11-07；匹配不代表真机验证。'
     [[ $VIRT == container* ]] && warn '容器内可见值不代表宿主机可由本脚本管理。'
     return "$rc"
 }
@@ -199,7 +207,8 @@ confirm() {
     (( YES )) && return 0
     [[ -t 0 ]] || { fail '非交互修改需要 --yes；先使用 --dry-run 查看。'; return 1; }
     local reply
-    read -r -p '确认应用？[y/N]：' reply || { warn '已取消。'; return 1; }
+    printf '\n' >&2
+    read -r -p '应用以上配置？[y/N，回车取消]：' reply || { warn '已取消。'; return 1; }
     case $reply in y|Y|yes|YES|Yes) return 0 ;; *) warn '已取消。'; return 1 ;; esac
 }
 validate_platform() {
@@ -381,28 +390,50 @@ apply_device_defaults() {
     (( QUEUE_EXPLICIT )) || QUEUE=$DEVICE_QUEUE
 }
 show_device_profile() {
-    local json
+    local json detail=${1:-full}
     json=$(hardware_snapshot) || return 1
+    ui_heading '设备资源'
     python3 -c 'import json,sys; d=json.load(sys.stdin)
-print("有效 CPU：%g（可见逻辑 CPU：%s；含亲和性和配额限制）"%(d["effective_cpus"],d["logical_cpus"]))
-print("有效内存：%.1f MiB；当前可用：%.1f MiB"%(d["memory_limit_bytes"]/1048576,d["memory_available_bytes"]/1048576))
-print("均衡建议：%s；队列预算 %.2f MiB；单流基准 1，压力测试建议 %s 流"%(d["recommended_qdisc"],d["queue_budget_bytes"]/1048576,d["pressure_streams"]))
-for n in d["notes"]:print("提示："+n)
-print("fq 包数按 4 KiB/包估算，不是严格内存上限；fq_codel/cake 可限制队列内存。")
-print("设备资源不能推算运营商带宽、RTT 或最优 TCP 缓冲区，脚本不自动放大这些参数。")
-sys.exit(not d["complete"])' <<< "$json" || return 1
+print("  CPU：%g 核有效 / %s 核可见"%(d["effective_cpus"],d["logical_cpus"]))
+print("  内存：%.1f MiB 有效 / %.1f MiB 可用"%(d["memory_limit_bytes"]/1048576,d["memory_available_bytes"]/1048576))
+print("  建议队列：%s"%d["recommended_qdisc"])
+print("  测试并发：单流 1 / 压力 %s 流"%d["pressure_streams"])
+for n in d["notes"]:print("  提示："+n)
+if sys.argv[1]=="full":
+ print("  队列预算：%.2f MiB"%(d["queue_budget_bytes"]/1048576))
+ print("")
+ print("说明")
+ print("  CPU 与内存已考虑亲和性及配额限制。")
+ print("  fq 按 4 KiB/包估算，预算不是严格内存上限。")
+ print("  fq_codel/cake 可限制队列内存。")
+ print("  设备资源不能推算线路带宽、RTT 或最优 TCP 缓冲区。")
+sys.exit(not d["complete"])' "$detail" <<< "$json" || return 1
     if [[ -n $IFACE ]] && has ip; then ip -o link show dev "$IFACE" || return 1; fi
 }
 show_change_plan() {
-    show_device_profile || return 1
+    show_device_profile compact || return 1
     apply_device_defaults || return 1
     detect_capabilities
-    say "新连接默认算法：${CURRENT_CC:-未知} → bbr"
-    say "默认队列：${CURRENT_QDISC:-未知} → $QUEUE（手动 --qdisc 优先）"
-    say "持久配置：$CONFIG；原状态：$STATE_DIR/baseline"
-    say 'enable 不替换当前网卡队列；queue 才会显式更换选定网卡，并检查拓扑和恢复条件。'
-    if (( AUTO )); then say "自动队列预算：$DEVICE_BUDGET 字节；仅在 queue --auto 时生效。"; fi
-    say '不调整 TCP 缓冲区/连接数，不安装内核，不自动重启。'
+    ui_heading '配置变更'
+    ui_field '新连接算法' "${CURRENT_CC:-未知} → bbr"
+    if [[ ${CURRENT_QDISC:-} == "$QUEUE" ]]; then
+        ui_field '默认队列' "$QUEUE（保持不变）"
+    else ui_field '默认队列' "${CURRENT_QDISC:-未知} → $QUEUE"; fi
+    (( ! QUEUE_EXPLICIT )) || ui_field '队列来源' '手动指定（优先于设备建议）'
+    ui_field '实际网卡队列' '本次不替换'
+    ui_heading '执行范围'
+    say '  设置新连接默认算法和默认队列。'
+    say '  保留 TCP 缓冲区、连接数与当前内核，不自动重启。'
+    say '  已有监听 socket 可能继续使用旧算法。'
+    if (( AUTO )); then
+        ui_heading '网卡队列预算（本次不应用）'
+        ui_field '预算字节数' "$DEVICE_BUDGET"
+        say '  仅 queue --auto 更换网卡队列时使用。'
+        say '  fq 为包数估算；fq_codel/cake 可限制内存。'
+    fi
+    ui_heading '配置与恢复'
+    ui_field '配置文件' "$CONFIG"
+    ui_field '原始备份' "$STATE_DIR/baseline"
 }
 show_queue_plan() {
     show_device_profile || return 1
@@ -435,7 +466,7 @@ ui_device_menu() {
     while :; do
         ui_heading '设备自适应（均衡稳定）'
         show_change_plan || { ui_pause; return 1; }
-        say '  1  仅预演  2  应用默认 BBR 配置  3  网卡队列配置  0  返回'
+        say ''; say '  1  仅预演'; say '  2  应用默认 BBR 配置'; say '  3  网卡队列配置'; say '  0  返回'
         ui_read '请选择 [0-3]' || return 0
         case $UI_INPUT in
             0|q|Q) return 0 ;; 1) ui_preview || : ;;
@@ -455,7 +486,27 @@ ui_init() {
         UI_YELLOW=$'\033[33m'; UI_RESET=$'\033[0m'
     fi
 }
-ui_heading() { printf '\n%s%s%s\n' "$UI_BOLD" "$1" "$UI_RESET"; }
+ui_width() {
+    local width=${COLUMNS:-64}
+    [[ $width =~ ^[0-9]{1,3}$ ]] || width=64
+    width=$((10#$width))
+    (( width >= 24 )) || width=24
+    (( width <= 64 )) || width=64
+    printf '%s' "$width"
+}
+ui_rule() {
+    local line
+    printf -v line '%*s' "$(ui_width)" ''
+    printf '%s%s%s\n' "$UI_CYAN" "${line// /-}" "$UI_RESET"
+}
+ui_heading() { printf '\n%s[%s]%s\n' "$UI_BOLD" "$1" "$UI_RESET"; }
+ui_field() {
+    local label=$1 value=$2
+    # Stack long values on narrow terminals; avoid CJK column padding.
+    if (( $(ui_width) < 50 && ${#value} > 22 )); then
+        printf '  %s：\n    %s\n' "$label" "$value"
+    else printf '  %s：%s\n' "$label" "$value"; fi
+}
 ui_read() {
     local prompt=$1 default=${2:-}
     printf '%s' "$prompt" >&2
@@ -483,18 +534,20 @@ ui_run() {
         if (( DRY_RUN )); then printf '\n%s[预演结束]%s 未执行修改或测速。\n' "$UI_GREEN" "$UI_RESET"
         else printf '\n%s[完成]%s %s\n' "$UI_GREEN" "$UI_RESET" "$title"; fi
     else
-        printf '\n%s[未完成]%s 退出码 %s；请查看上方原因，处理后可重试。\n' "$UI_YELLOW" "$UI_RESET" "$rc"
+        printf '\n%s[未完成]%s %s\n' "$UI_YELLOW" "$UI_RESET" "$title"
+        printf '  退出码：%s\n  请查看上方原因，处理后重试。\n' "$rc"
     fi
     ui_pause
     return "$rc"
 }
 ui_overview() {
     detect_system; detect_capabilities
-    printf '\n%s------------------------------------------------------------%s\n' "$UI_CYAN" "$UI_RESET"
+    say ''; ui_rule
     printf '%sBBR 管理工具 v%s%s\n' "$UI_BOLD" "$VERSION" "$UI_RESET"
-    say "系统：$OS_ID $OS_VERSION / $ARCH   内核：$(uname -r)"
-    say "默认 TCP：${CURRENT_CC:-未知}   默认队列：${CURRENT_QDISC:-未知}"
-    say '网卡队列与连接详情见状态；完整诊断和手动参数见高级设置。'
+    ui_field '系统' "$OS_ID $OS_VERSION / $ARCH"
+    ui_field '内核' "$(uname -r)"
+    ui_field '默认 TCP' "${CURRENT_CC:-未知}"
+    ui_field '默认队列' "${CURRENT_QDISC:-未知}"
     if (( DRY_RUN )); then say '运行模式：预演，不修改系统、不发起测速'
     elif [[ $VIRT == container* ]]; then say '运行模式：容器，不能修改系统；可诊断、预演和测速'
     elif (( ! SUPPORTED )); then say '运行模式：此系统不在适配名单；可诊断、预演和测速'
@@ -508,7 +561,7 @@ ui_overview() {
         [[ ! -d $STATE_DIR/queue.pending ]] || say '待处理：队列事务中断，请进入「恢复与排障 → 原网卡队列」'
         [[ ! -d $STATE_DIR/kernel.pending ]] || say '待处理：内核事务中断，请进入「恢复与排障 → 内核启动项」'
     fi
-    printf '%s------------------------------------------------------------%s\n' "$UI_CYAN" "$UI_RESET"
+    ui_rule
 }
 ui_ask() {
     local dest=$1 label=$2 kind=$3 default=${4:-} valid
@@ -582,7 +635,10 @@ ui_select_queue() {
     local default=1
     case $QUEUE in fq_codel) default=2 ;; cake) default=3 ;; esac
     while :; do
-        say '  1  fq（BBR 常用搭配）  2  fq_codel  3  cake  0  返回'
+        say '  1  fq（BBR 常用搭配）'
+        say '  2  fq_codel'
+        say '  3  cake'
+        say '  0  返回'
         ui_read '选择队列' "$default" || return 1
         case $UI_INPUT in
             1) QUEUE=fq; QUEUE_EXPLICIT=1; return 0 ;; 2) QUEUE=fq_codel; QUEUE_EXPLICIT=1; return 0 ;; 3) QUEUE=cake; QUEUE_EXPLICIT=1; return 0 ;;
@@ -594,7 +650,10 @@ ui_queue_menu() {
     local IFACE=$IFACE QUEUE=$QUEUE QUEUE_EXPLICIT=$QUEUE_EXPLICIT
     while :; do
         ui_heading '队列管理'
-        say '  1  查看实际队列  2  更换网卡队列  3  恢复原队列  0  返回'
+        say '  1  查看实际队列'
+        say '  2  更换网卡队列'
+        say '  3  恢复原队列'
+        say '  0  返回'
         say '仅修改本次运行；复杂拓扑不自动更换，重启后不自动重建。'
         ui_read '请选择 [0-3]' || return 0
         case $UI_INPUT in
@@ -710,10 +769,14 @@ ui_recovery_menu() {
 ui_advanced_menu() {
     while :; do
         ui_heading '高级设置'
-        say '  1  手动 BBR 配置       2  完整诊断'
-        say '  3  内核管理           4  网卡队列管理'
-        say '  5  设备方案详情       6  仅预演 BBR 配置'
-        say '  7  全部命令行用法     8  比较历史测速结果'
+        say '  1  手动 BBR 配置'
+        say '  2  完整诊断'
+        say '  3  内核管理'
+        say '  4  网卡队列管理'
+        say '  5  设备方案详情'
+        say '  6  仅预演 BBR 配置'
+        say '  7  全部命令行用法'
+        say '  8  比较历史测速结果'
         say '  0  返回'
         ui_read '请选择 [0-8]' || return 0
         case $UI_INPUT in
@@ -738,7 +801,7 @@ menu() {
         say '  3  测速'
         say '  4  恢复与排障'
         say '  5  高级设置（全部功能）'
-        say '  0  退出       r  刷新'
+        say ''; say '  0  退出   r  刷新'
         ui_read '请选择 [0-5 / r]' || { say ''; return 0; }
         case $UI_INPUT in
             0|q|Q) say '已退出。'; return 0 ;;
@@ -1060,8 +1123,13 @@ enable_bbr_impl() {
         detect_conflicts || return 1
         return 0
     fi
-    say "变更预览：默认算法 ${CURRENT_CC:-未知} → bbr；默认队列 ${CURRENT_QDISC:-未知} → $QUEUE。"
-    (( ! AUTO )) || show_change_plan || return 1
+    if (( AUTO )); then show_change_plan || return 1
+    else
+        ui_heading '配置变更'
+        ui_field '新连接算法' "${CURRENT_CC:-未知} → bbr"
+        ui_field '默认队列' "${CURRENT_QDISC:-未知} → $QUEUE"
+        say '  保留当前网卡队列、TCP 缓冲区和内核，不自动重启。'
+    fi
     require_mutation || return 1
     prepare_state && acquire_lock || return 1
     secure_path "$CONFIG" && secure_path "$LOG" || return 1
