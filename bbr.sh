@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # BBR manager — only this script is required. Bash >= 4.4, Linux.
 # Algorithm references: https://github.com/google/bbr
-# No remote shell execution, automatic reboot, or kernel removal.
+# No remote shell execution or kernel removal. Kernel install can reboot.
 
-VERSION=1.1.7
+VERSION=1.2.0
 STATE_DIR=/var/lib/bbr-script
 CONFIG=/etc/sysctl.d/99-zz-bbr-script.conf
 LOG=$STATE_DIR/bbr-script.log
@@ -22,7 +22,7 @@ warn() { printf '提示：%s\n' "$*" >&2; }
 fail() { printf '错误：%s\n' "$*" >&2; return 1; }
 usage() {
     cat <<'HELP'
-BBR 管理工具：检测、预演、启用和恢复；不会自动重启。
+BBR 管理工具：检测、预演、启用和恢复；仅内核安装成功切换后自动重启。
 用法：bash bbr.sh <命令> [选项]
   install-deps            安装运行依赖（不安装内核或启动器）
   status / doctor         查看系统、算法、队列和连接诊断
@@ -116,8 +116,10 @@ ensure_dependencies() {
                 else package=iproute; fi ;;
             flock|unshare|setsid) package=util-linux ;;
             modprobe) package=kmod ;;
+            lsinitramfs) [[ $manager == apt ]] || return 1; package=initramfs-tools-core ;;
+            lsinitrd) [[ $manager == dnf ]] || return 1; package=dracut ;;
             awk) package=gawk ;; cmp) package=diffutils ;;
-            timeout|stat|mktemp|date|head|cat|cp|mv|chmod|sync|rm|mkdir|rmdir|uname|df|readlink) package=coreutils ;;
+            timeout|stat|mktemp|date|head|tail|sort|cat|cp|mv|chmod|sync|rm|mkdir|rmdir|uname|df|readlink) package=coreutils ;;
             *) fail "没有工具 $tool 的可信包映射"; return 1 ;;
         esac
         present=0
@@ -447,7 +449,12 @@ recovery_center() {
     if [[ -d $STATE_DIR && ! -x $STATE_DIR ]]; then fail '当前用户无读取权限，请以 root 查看恢复记录。'; return 1; fi
     local pending=0
     if [[ -d $STATE_DIR/transaction ]]; then say '配置事务未完成：bash bbr.sh restore'; pending=1; fi
-    if [[ -d $STATE_DIR/kernel.pending ]]; then say '内核事务未完成：bash bbr.sh kernel recover'; pending=1; fi
+    if [[ -d $STATE_DIR/kernel.pending ]]; then
+        if [[ -f $STATE_DIR/kernel.pending/target-version ]]; then say '内核切换待确认：bash bbr.sh kernel verify（回退用 kernel recover）'
+        else say '内核事务未完成：bash bbr.sh kernel recover'; fi
+        pending=1
+    fi
+    [[ ! -d $STATE_DIR/kernel-switched ]] || say '已保留内核切换恢复记录：bash bbr.sh kernel recover'
     if [[ -d $STATE_DIR/queue.pending ]]; then say '队列事务未完成：bash bbr.sh queue-restore'; pending=1; fi
     (( pending )) || say '没有未完成事务。'
     if [[ -d $STATE_DIR/baseline ]]; then
@@ -620,7 +627,7 @@ ui_overview() {
         [[ ! -d $STATE_DIR/baseline ]] || say '原配置备份：可恢复'
         [[ ! -d $STATE_DIR/transaction ]] || say '待处理：配置事务中断，请进入「恢复与排障 → 原 BBR 配置」'
         [[ ! -d $STATE_DIR/queue.pending ]] || say '待处理：队列事务中断，请进入「恢复与排障 → 原网卡队列」'
-        [[ ! -d $STATE_DIR/kernel.pending ]] || say '待处理：内核事务中断，请进入「恢复与排障 → 内核启动项」'
+        [[ ! -d $STATE_DIR/kernel.pending ]] || say '待核验：内核操作有记录，请进入「内核管理 → 检查重启后的内核」'
     fi
     ui_rule
 }
@@ -661,7 +668,7 @@ ui_kernel_menu() {
             0|q|Q) return 0 ;;
             1) ACTION=list ;; 2) ACTION=plan ;;
             3) ACTION=install
-               say '将从官方签名仓库安装；保留旧内核及原默认启动项，不自动重启。' ;;
+               say '将从官方签名仓库安装并切换默认内核；保留旧内核，校验成功后自动重启。' ;;
             4) ACTION=verify ;;
             5) ACTION=recover; say '恢复安装前默认启动项；不会卸载部分安装的软件包。' ;;
             *) warn '无效选择，请输入 0-5。'; continue ;;
@@ -1653,7 +1660,7 @@ boot_preflight() {
             fail '自动安装要求预先配置 GRUB_DEFAULT=saved 并保存当前内核启动项；避免新内核意外成为默认。'; return 1;
         }
         local env
-        env=$(grub-editenv list) || return 1
+        env=$(grub-editenv - list) || return 1
         [[ $env != *next_entry=* ]] || { fail '存在一次性启动项，请先处理'; return 1; }
         BOOT_ENTRY=$(printf '%s\n' "$env" | sed -n 's/^saved_entry=//p')
         [[ $BOOT_ENTRY == *"$(uname -r)"* && $BOOT_ENTRY != *$'\n'* ]] || { fail 'saved_entry 必须明确指向当前运行内核，而非索引'; return 1; }
@@ -1673,23 +1680,67 @@ preserve_boot() {
         [[ $observed == "$BOOT_ENTRY" ]] || { fail '默认启动内核读回校验失败'; return 1; }
     elif [[ $BOOT_MODE == grub ]]; then
         grub-set-default "$BOOT_ENTRY" || return 1
-        grub-editenv unset next_entry || return 1
-        observed=$(grub-editenv list) || return 1
+        grub-editenv - unset next_entry || return 1
+        observed=$(grub-editenv - list) || return 1
         saved=$(printf '%s\n' "$observed" | sed -n 's/^saved_entry=//p')
         [[ $saved == "$BOOT_ENTRY" && $observed != *next_entry=* ]] || { fail 'GRUB 启动项读回校验失败'; return 1; }
     else return 1; fi
 }
+read_boot_default() {
+    local mode=$1 env
+    case $mode in
+        grubby) grubby --default-kernel ;;
+        grub)
+            env=$(grub-editenv - list) || return 1
+            [[ $env != *next_entry=* ]] || return 1
+            printf '%s\n' "$env" | sed -n 's/^saved_entry=//p' ;;
+        *) return 1 ;;
+    esac
+}
+verify_kernel_switch() {
+    local dir="$STATE_DIR/kernel.pending" target entry mode observed history
+    [[ -f $dir/target-version ]] || dir="$STATE_DIR/kernel-switched"
+    [[ -f $dir/target-version ]] || return 0
+    target=$(cat "$dir/target-version") && entry=$(cat "$dir/target-entry") && mode=$(cat "$dir/mode") || return 1
+    [[ $target =~ ^[0-9][a-zA-Z0-9.+_~-]*$ ]] || { fail '目标内核记录不合法'; return 1; }
+    [[ -n $entry && $entry != -* && $entry != *$'\n'* && $entry != *$'\r'* ]] || { fail '目标启动项记录不合法'; return 1; }
+    ui_heading '内核切换核验'
+    ui_field '目标内核' "$target"
+    ui_field '运行内核' "$(uname -r)"
+    [[ $(uname -r) == "$target" ]] || { fail '尚未运行目标内核；保留恢复记录，请检查控制台启动结果。'; return 1; }
+    observed=$(read_boot_default "$mode") || { fail '无法读取默认启动项，暂不确认切换'; return 1; }
+    [[ $observed == "$entry" ]] || { fail '默认启动项与目标不一致，暂不确认切换'; return 1; }
+    if [[ $dir == "$STATE_DIR/kernel.pending" ]]; then
+        if (( DRY_RUN )); then
+            say '  [预演] 仅核验运行值，不写锁文件或归档恢复记录。'
+        elif (( EUID == 0 )); then
+            prepare_state && acquire_lock || return 1
+            # Recheck the journal under lock: no concurrent recovery or install.
+            [[ $(cat "$dir/target-version") == "$target" && $(cat "$dir/target-entry") == "$entry" ]] || return 1
+            [[ $(read_boot_default "$mode") == "$entry" ]] || return 1
+            if [[ -d $STATE_DIR/kernel-switched ]]; then
+                history=$(mktemp -d "$STATE_DIR/kernel-history.XXXXXXXX") || return 1
+                mv -- "$STATE_DIR/kernel-switched" "$history/previous-switch" || return 1
+            fi
+            mv -- "$dir" "$STATE_DIR/kernel-switched" || return 1
+            sync -f "$STATE_DIR" || return 1
+        else say '  运行值匹配；以 root 再运行 kernel verify 完成恢复记录归档。'; fi
+    fi
+    ui_banner '执行成功' '目标内核已运行，默认启动项已核验'
+    say '  旧内核仍保留；kernel recover 可恢复原默认启动项。'
+}
+
 kernel_verify() {
     say "当前运行内核：$(uname -r)"
     say 'BBR 实现版本：未知；发行版包签名不证明 BBRv3，不凭 bbr 名称判断。'
     if has dpkg-query; then dpkg-query -W -f='${binary:Package} ${Version} ${db:Status-Abbrev}\n' 'linux-image*' 2>/dev/null || :
     elif has rpm; then rpm -q kernel kernel-core || :; fi
-    [[ ! -r /var/run/reboot-required ]] || say '发行版提示需要重启；本脚本不会自动重启。'
+    [[ ! -r /var/run/reboot-required ]] || say '发行版提示需要重启；仅 kernel install 成功切换时自动重启。'
     if [[ -r $STATE_DIR/kernel-before ]]; then
         say "安装前运行内核：$(cat "$STATE_DIR/kernel-before")"
         [[ $(cat "$STATE_DIR/kernel-before") != "$(uname -r)" ]] || say '运行内核尚未改变；安装成功不等于已启动新内核。'
     fi
-    return 0
+    verify_kernel_switch
 }
 kernel_plan() {
     detect_system
@@ -1697,7 +1748,8 @@ kernel_plan() {
     package=$(kernel_package) || return 1
     say "内核计划：$OS_ID $OS_VERSION / $ARCH；软件包 $package；通道 $CHANNEL。"
     say '安装前要求：官方签名仓库、可核验的旧内核与固定启动项、/boot 至少 700 MiB、模块目录至少 2 GiB 空间。'
-    say '保留旧内核；不移除软件包、不自动重启。安装后保留原默认启动项，新内核需人工选择测试。'
+    say '保留旧内核；成功安装并校验后，设置新内核默认启动，10 秒后自动重启。'
+    say '找不到更新内核、启动项有歧义或任一步失败时，不重启；失败恢复原默认启动项。'
     say '容器、不支持的启动方式、第三方源或验证关闭时拒绝安装。'
     return 0
 }
@@ -1731,7 +1783,7 @@ kernel_signal() {
 }
 
 begin_kernel_journal() {
-    [[ ! -e $STATE_DIR/kernel.pending ]] || { fail '存在未完成内核事务，请先 kernel recover'; return 1; }
+    [[ ! -e $STATE_DIR/kernel.pending ]] || { fail '存在待确认的内核事务，请先 kernel verify 或 kernel recover'; return 1; }
     local temp
     temp=$(mktemp -d "$STATE_DIR/kernel-journal.XXXXXXXX") || return 1
     printf '%s\n' "$BOOT_MODE" > "$temp/mode" || return 1
@@ -1770,10 +1822,13 @@ kernel_exit() {
     trap - EXIT; exit "$rc"
 }
 kernel_recover() (
-    if (( DRY_RUN )); then say '预演：从 kernel.pending 恢复安装前默认启动项，不卸载软件包。'; return 0; fi
+    if (( DRY_RUN )); then say '预演：从内核事务或已确认切换记录恢复原默认启动项，不卸载软件包。'; return 0; fi
     ensure_dependencies sysctl flock awk stat mktemp cp mv chmod sync rm mkdir rmdir grep cmp date uname cat || return $?
     detect_system; require_mutation recovery || return 1
     prepare_state && acquire_lock || return 1
+    if [[ ! -e $STATE_DIR/kernel.pending && -d $STATE_DIR/kernel-switched ]]; then
+        mv -- "$STATE_DIR/kernel-switched" "$STATE_DIR/kernel.pending" || return 1
+    fi
     recover_kernel_journal
 )
 vendor_key_owned() {
@@ -1782,7 +1837,8 @@ vendor_key_owned() {
     [[ $owner == "$2" ]] || { fail '所选签名 key 不属于已验证的发行版 key 软件包'; return 1; }
 }
 install_rpm_kernel() {
-    local key_package keys key dir rpmfile
+    local key_package keys key dir rpmfile metadata
+    KERNEL_VERIFIED_VERSIONS=''
     [[ $OS_ID == rocky ]] && key_package=rocky-gpg-keys || key_package=almalinux-gpg-keys
     keys=$(dnf_trust) || return 1
     while IFS= read -r key; do vendor_key_owned "$key" "$key_package" || return 1; done <<< "$keys"
@@ -1803,6 +1859,10 @@ install_rpm_kernel() {
         [[ -f $rpmfile && ! -L $rpmfile ]] || continue
         signature=$(rpmkeys --dbpath "$dir/rpmdb" --checksig --verbose "$rpmfile") || { fail 'RPM 签名验证失败'; return 1; }
         grep -Eiq 'Signature.*: OK' <<< "$signature" || { fail 'RPM 缺少可验证的签名'; return 1; }
+        metadata=$(rpm -qp --qf '%{NAME}\t%{VERSION}-%{RELEASE}.%{ARCH}' "$rpmfile") || return 1
+        if [[ $metadata == kernel-core$'\t'* ]]; then
+            KERNEL_VERIFIED_VERSIONS+="${metadata#*$'\t'}"$'\n'
+        fi
         packages+=("$rpmfile")
     done
     (( ${#packages[@]} > 0 )) || { say '没有下载新内核软件包，可能已是当前仓库最新版本。'; return 0; }
@@ -1829,12 +1889,222 @@ running_kernel_pins() {
     printf '%s\n' "${pins[@]}"
 }
 
+# Resolve only the image dependencies of the exact distro metapackage installed
+# by this transaction. Unrelated pre-existing/custom images are never candidates.
+kernel_inventory() {
+    local output root version
+    if [[ $OS_ID == debian || $OS_ID == ubuntu ]]; then
+        root=$(kernel_package) || return 1
+        output=$(dpkg-query -W -f='${binary:Package}\t${db:Status-Status}\t${Depends}\t${Pre-Depends}\n') || return 1
+        python3 /dev/fd/3 "$root" 3<<'PYCODE' <<< "$output"
+import re,sys
+try:
+    packages={}
+    for line in sys.stdin:
+        fields=line.rstrip('\n').split('\t')
+        if len(fields)<2 or fields[1]!='installed':continue
+        name=fields[0].split(':')[0]
+        if name!=sys.argv[1] and not name.startswith('linux-image-'):continue
+        if name in packages:raise ValueError('软件包架构存在歧义')
+        packages[name]=','.join(fields[2:])
+    queue=[sys.argv[1]];seen=set();images=[]
+    while queue:
+        name=queue.pop()
+        if name in seen:continue
+        seen.add(name)
+        if name not in packages:raise ValueError('内核依赖未安装：'+name)
+        if re.fullmatch(r'linux-image-[0-9][a-zA-Z0-9.+_~-]*',name):
+            images.append((name[len('linux-image-'):],name));continue
+        for group in packages[name].split(','):
+            choices=[]
+            for alt in group.split('|'):
+                m=re.match(r'\s*([a-z0-9][a-z0-9+.-]*)(?::[a-z0-9-]+)?',alt)
+                if m and m[1].startswith('linux-image-') and m[1] in packages:choices.append(m[1])
+            if len(choices)>1:raise ValueError('内核镜像依赖存在歧义')
+            queue.extend(choices)
+    if len(images)!=1:raise ValueError('无法唯一确定发行版元包依赖的内核镜像')
+    for release,name in images:print(release+'\t'+name)
+except ValueError as e:
+    print('内核依赖检查失败：'+str(e),file=sys.stderr);sys.exit(1)
+PYCODE
+    else
+        # Only versions extracted from RPMs verified against the vendor keyring
+        # in install_rpm_kernel may be selected for an automatic reboot.
+        while IFS= read -r version; do
+            [[ -n $version ]] || continue
+            [[ $version =~ ^[0-9][a-zA-Z0-9.+_~-]*$ ]] || return 1
+            rpm -q "kernel-core-$version" >/dev/null || return 1
+            printf '%s\tkernel-core-%s\n' "$version" "$version"
+        done <<< "${KERNEL_VERIFIED_VERSIONS:-}"
+    fi
+}
+select_new_kernel() {
+    local inventory running latest version package
+    running=$(uname -r) || return 1
+    inventory=$(kernel_inventory) || { fail '无法读取可信事务的内核候选'; return 1; }
+    [[ -n $inventory ]] || return 3
+    latest=$( { printf '%s\n' "$running"; while IFS=$'\t' read -r version package; do
+        [[ $version =~ ^[0-9][a-zA-Z0-9.+_~-]*$ ]] || return 1
+        printf '%s\n' "$version"
+    done <<< "$inventory"; } | sort -V | tail -n 1) || return 1
+    [[ -n $latest && $latest != "$running" ]] || return 3
+    TARGET_VERSION=$latest TARGET_PACKAGE=''
+    while IFS=$'\t' read -r version package; do
+        [[ $version != "$latest" ]] || TARGET_PACKAGE=$package
+    done <<< "$inventory"
+    [[ -n $TARGET_PACKAGE ]] || return 1
+    TARGET_IMAGE="/boot/vmlinuz-$TARGET_VERSION"
+}
+validate_kernel_target() {
+    local initrd check module_dir config="/boot/config-$TARGET_VERSION"
+    [[ $TARGET_VERSION =~ ^[0-9][a-zA-Z0-9.+_~-]*$ && $TARGET_IMAGE == "/boot/vmlinuz-$TARGET_VERSION" ]] || return 1
+    if [[ $OS_ID == debian || $OS_ID == ubuntu ]]; then initrd="/boot/initrd.img-$TARGET_VERSION"
+    else initrd="/boot/initramfs-$TARGET_VERSION.img"; fi
+    local file
+    for file in "$TARGET_IMAGE" "$initrd" "$config"; do
+        secure_path "$file" && [[ -f $file && -s $file ]] || { fail "新内核启动文件缺失或不安全：$file"; return 1; }
+    done
+    module_dir=$(readlink -f -- "/lib/modules/$TARGET_VERSION") || return 1
+    [[ $module_dir == "/lib/modules/$TARGET_VERSION" || $module_dir == "/usr/lib/modules/$TARGET_VERSION" ]] || { fail '模块目录位于未知位置'; return 1; }
+    secure_path "$module_dir" || return 1
+    [[ -d $module_dir ]] || { fail '新内核模块目录缺失'; return 1; }
+    grep -Eq '^CONFIG_TCP_CONG_BBR=(y|m)$' "$config" || { fail '目标内核未启用 BBR 支持'; return 1; }
+    case $(uname -m) in
+        x86_64) grep -qx 'CONFIG_X86_64=y' "$config" || return 1 ;;
+        aarch64) grep -qx 'CONFIG_ARM64=y' "$config" || return 1 ;;
+        *) fail '目标内核架构未适配'; return 1 ;;
+    esac
+    if grep -qx 'CONFIG_TCP_CONG_BBR=m' "$config"; then
+        local bbr_module=0
+        for file in "$module_dir"/kernel/net/ipv4/tcp_bbr.ko{,.xz,.zst,.gz}; do
+            [[ ! -f $file || ! -s $file ]] || bbr_module=1
+        done
+        (( bbr_module )) || { fail '目标内核 BBR 模块缺失'; return 1; }
+    fi
+    if [[ $OS_ID == debian || $OS_ID == ubuntu ]]; then
+        if ! has lsinitramfs || ! lsinitramfs "$initrd" >/dev/null; then
+            fail '需要可用的 lsinitramfs 且目标 initramfs 必须可解包'; return 1
+        fi
+    else
+        if ! has lsinitrd || ! lsinitrd "$initrd" >/dev/null; then
+            fail '需要可用的 lsinitrd 且目标 initramfs 必须可解析'; return 1
+        fi
+    fi
+    if [[ $OS_ID == debian || $OS_ID == ubuntu ]]; then
+        check=$(dpkg --verify "$TARGET_PACKAGE") || { fail '目标内核软件包文件校验失败'; return 1; }
+        # Minimal systems intentionally exclude packaged documentation. Missing
+        # docs do not affect boot integrity; all other verification output blocks.
+        check=$(printf '%s\n' "$check" | awk '!/^missing[[:space:]]+\/usr\/share\/(doc|man)\//') || return 1
+    else check=$(rpm -V "$TARGET_PACKAGE") || { fail '目标内核软件包文件校验失败'; return 1; }; fi
+    [[ -z $check ]] || { fail '目标内核软件包存在被修改的文件'; return 1; }
+    TARGET_INITRD=$initrd
+}
+select_grub_kernel_entry() {
+    python3 - "$@" <<'PYCODE'
+import pathlib,re,shlex,sys
+try:
+    cfg,new,old,saved=sys.argv[1:]
+    previous=saved.split('>')[-1]
+    prefix='gnulinux-'+old+'-advanced-'
+    if not previous.startswith(prefix):raise ValueError('原启动项不是可识别的普通内核 ID')
+    disk=previous[len(prefix):]
+    if not re.fullmatch(r'[a-zA-Z0-9-]+',disk):raise ValueError('启动项磁盘标识不合法')
+    submenu='gnulinux-advanced-'+disk
+    if '>' in saved and saved.rsplit('>',1)[0]!=submenu:raise ValueError('原启动项层级无法确认')
+    target='gnulinux-'+new+'-advanced-'+disk
+    menus=0;matches=[];entry=None;in_submenu=False
+    def finish():
+        global entry
+        if entry is not None and entry[0]==target:matches.append(entry)
+        entry=None
+    for line in pathlib.Path(cfg).read_text().splitlines():
+        stripped=line.strip()
+        if re.match(r'^(submenu|menuentry)\s',stripped):
+            finish()
+            m=re.search(r'(?:--id|\$menuentry_id_option)\s+([\'\"])(.*?)\1',stripped)
+            ident=m[2] if m else ''
+            if stripped.startswith('submenu '):
+                in_submenu=ident==submenu
+                if in_submenu:menus+=1
+            else:entry=[ident,[],[],in_submenu]
+        elif stripped=='}':
+            if entry is not None:finish()
+            else:in_submenu=False
+        elif entry is not None:
+            fields=shlex.split(stripped,comments=True)
+            if fields and fields[0] in ('linux','linuxefi') and len(fields)>1:entry[1].append(fields[1])
+            elif fields and fields[0] in ('initrd','initrdefi'):entry[2].extend(fields[1:])
+    finish()
+    if menus!=1 or len(matches)!=1:raise ValueError('目标启动项缺失或存在歧义')
+    _,images,initrds,nested=matches[0]
+    if not nested or len(images)!=1 or images[0] not in ('/vmlinuz-'+new,'/boot/vmlinuz-'+new):raise ValueError('目标启动项内核路径不匹配')
+    if not any(p in ('/initrd.img-'+new,'/boot/initrd.img-'+new) for p in initrds):raise ValueError('目标启动项 initramfs 不匹配')
+    print(submenu+'>'+target)
+except (ValueError,OSError) as e:
+    print('启动项检查失败：'+str(e),file=sys.stderr);sys.exit(1)
+PYCODE
+}
+resolve_kernel_boot_entry() {
+    local info
+    if [[ $BOOT_MODE == grub ]]; then
+        TARGET_ENTRY=$(select_grub_kernel_entry /boot/grub/grub.cfg "$TARGET_VERSION" "$(uname -r)" "$BOOT_ENTRY") || return 1
+    elif [[ $BOOT_MODE == grubby ]]; then
+        info=$(grubby --info="$TARGET_IMAGE") || return 1
+        [[ $(printf '%s\n' "$info" | grep -c '^kernel=') == 1 ]] || { fail '目标内核启动项不唯一'; return 1; }
+        grep -Fxq "kernel=\"$TARGET_IMAGE\"" <<< "$info" || { fail '目标启动内核路径不匹配'; return 1; }
+        grep -Fxq "initrd=\"$TARGET_INITRD\"" <<< "$info" || { fail '目标 initramfs 路径不匹配'; return 1; }
+        TARGET_ENTRY=$TARGET_IMAGE
+    else fail '不支持的启动器'; return 1; fi
+}
+request_kernel_reboot() {
+    if has systemctl && [[ $(cat /proc/1/comm) == systemd ]]; then systemctl reboot
+    elif has reboot; then reboot
+    else fail '找不到受支持的重启命令'; return 1; fi
+}
+complete_kernel_switch() {
+    local rc=0 original=$BOOT_ENTRY
+    select_new_kernel || rc=$?
+    if (( rc == 3 )); then
+        recover_kernel_journal || return 1
+        trap - EXIT INT TERM HUP
+        ui_banner '无需修改' '没有比当前运行版本更新的内核，不重启'
+        return 0
+    fi
+    (( rc == 0 )) || return "$rc"
+    validate_kernel_target && resolve_kernel_boot_entry || return 1
+    printf '%s\n' "$TARGET_VERSION" > "$STATE_DIR/kernel.pending/target-version" || return 1
+    printf '%s\n' "$TARGET_ENTRY" > "$STATE_DIR/kernel.pending/target-entry" || return 1
+    sync -f "$STATE_DIR/kernel.pending" || return 1
+    BOOT_ENTRY=$TARGET_ENTRY
+    preserve_boot || { BOOT_ENTRY=$original; return 1; }
+    # The journal retains the original default for explicit or automatic recovery.
+    log_event "kernel default switched target=$TARGET_VERSION" || return 1
+    ui_banner '执行成功' '新内核已设为默认启动项'
+    ui_change '默认启动项' "$original" "$TARGET_ENTRY" actual
+    ui_field '下次启动内核' "$TARGET_VERSION"
+    say '  [已保留] 旧内核及启动项恢复记录。'
+    say '  [待验证] 新内核实际启动情况；不能据此认定 BBRv3。'
+    say '  10 秒后自动重启；按 Ctrl+C 取消并恢复原默认启动项。'
+    sync || return 1
+    sleep 10 || return 1
+    # SSH may disconnect as soon as reboot is accepted. Do not roll back a
+    # verified default merely because that disconnect sends SIGHUP.
+    trap '' HUP INT TERM
+    request_kernel_reboot || { rc=$?; fail '自动重启失败，将恢复原默认启动项'; return "$rc"; }
+    KERNEL_ACTIVE=0
+    trap - EXIT
+    say '  [已请求重启] 重连后运行 kernel verify 核验。'
+}
+
 kernel_install() ( kernel_install_impl )
 kernel_install_impl() {
+    say '内核安装成功并切换默认启动项后，将自动重启。'
     detect_system; require_mutation || return 1
-    ensure_dependencies python3 setsid || return $?
+    ensure_dependencies python3 setsid sort tail || return $?
+    if [[ $OS_ID == debian || $OS_ID == ubuntu ]]; then ensure_dependencies lsinitramfs || return $?
+    else ensure_dependencies lsinitrd || return $?; fi
     prepare_state && acquire_lock || return 1
-    [[ ! -e $STATE_DIR/kernel.pending ]] || { fail '存在未完成内核事务，请先 kernel recover'; return 1; }
+    [[ ! -e $STATE_DIR/kernel.pending ]] || { fail '存在待确认的内核事务，请先 kernel verify 或 kernel recover'; return 1; }
     boot_preflight || return 1
     [[ -d /boot && -d /lib/modules ]] || { fail '缺少 /boot 或 /lib/modules'; return 1; }
     local free_boot free_modules package rc=0
@@ -1873,18 +2143,11 @@ kernel_install_impl() {
     else
         install_rpm_kernel || rc=$?
     fi
-    # Package scripts may update the bootloader even on a failed transaction.
-    recover_kernel_journal || return 1
-    trap - EXIT INT TERM HUP
-    (( rc == 0 )) || { fail "内核包事务失败，退出码 $rc；未自动删除部分安装内容，请检查包管理器状态。"; return "$rc"; }
-    log_event 'kernel package transaction completed; old boot entry retained' || warn '日志失败'
-    ui_heading '内核安装结果'
-    ui_field '软件包' "$package"
-    say '  [已完成] 内核软件包安装事务。'
-    ui_change '运行内核' "$(cat "$STATE_DIR/kernel-before" 2>/dev/null || :)" "$(uname -r)" actual
-    say '  [已保留] 原默认启动项；系统未重启。'
-    say '  [待验证] 新内核能否启动及 BBR 实现版本。'
-    say '  下一步：通过控制台选择新内核，再运行 kernel verify。'
+    if (( rc != 0 )); then
+        fail "内核包事务失败，退出码 $rc；不重启，恢复原默认启动项。"
+        return "$rc"
+    fi
+    complete_kernel_switch
 }
 kernel_command() {
     case ${ACTION:-plan} in list|plan|install|verify|recover) ;; *) fail '未知 kernel 子命令'; return 2 ;; esac
@@ -1893,7 +2156,7 @@ kernel_command() {
         return 1
     fi
     case ${ACTION:-plan} in
-        list) detect_system; kernel_verify; kernel_plan ;;
+        list) detect_system; kernel_verify || return 1; kernel_plan ;;
         plan) kernel_plan ;;
         verify) kernel_verify ;;
         recover) kernel_recover ;;
