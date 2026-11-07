@@ -41,14 +41,14 @@ bash bbr.sh menu
 
 | 发行版 | 名单内版本 |
 | --- | --- |
-| Debian | 13 |
-| Ubuntu | 24.04 LTS（含各点版本）、26.04、26.10 |
+| Debian | 12 LTS、13 |
+| Ubuntu | 22.04 LTS、24.04 LTS（均含各点版本）、26.04、26.10 |
 | Rocky Linux | 9.8、10.2 |
 | AlmaLinux | 9.8、10.2 |
 
 架构识别覆盖 `x86_64` 和 `aarch64`。**名单匹配不等于已完成该发行版或架构的真机验证。** 后续版本需更新名单，不自动视为兼容。
 
-Ubuntu 24.04 LTS 仍处于支持期，已明确纳入名单；24.04.x 使用相同的 `VERSION_ID=24.04` 判断。名单通过后仍须检查实际内核能力、root 权限和恢复条件。
+名单同时覆盖仍在支持期内的 Debian 12 LTS、Ubuntu 22.04/24.04 LTS，不再只按最近两年的发布日期筛选。Ubuntu 各点版本使用相同的 `VERSION_ID` 判断。名单通过后仍须检查实际内核能力、root 权限和恢复条件。
 
 其他版本仍可查看状态、预演和测速，但新配置写入受限。已有恢复记录不受名单变化阻断，仍需 root、非容器环境及有效的恢复条件。
 
@@ -77,6 +77,8 @@ bash bbr.sh install-deps
 ```
 
 添加 `--no-install` 可禁止自动安装。非 root 用户、软件源不可用或安装后工具仍缺失时，会明确报错并停止依赖该工具的操作。下载脚本所需的 Bash 和 curl 需由系统预先提供。
+
+日志从 v1.1.4 起保存在 root 专用状态目录，避免系统 `/var/log` 的组写入权限触发路径保护。旧日志保留原处，不自动迁移或修改系统目录权限。
 
 ## 常用命令
 
@@ -215,7 +217,7 @@ bash bbr.sh recovery
 | --- | --- |
 | 持久配置 | `/etc/sysctl.d/99-zz-bbr-script.conf` |
 | 原始状态、事务及历史记录 | `/var/lib/bbr-script/` |
-| 修改操作日志 | `/var/log/bbr-script.log` |
+| 修改操作日志 | `/var/lib/bbr-script/bbr-script.log` |
 | 恢复配置或中断的配置事务 | `bash bbr.sh restore` |
 | 恢复网卡队列 | `bash bbr.sh queue-restore` |
 | 恢复内核安装前默认启动项 | `bash bbr.sh kernel recover` |

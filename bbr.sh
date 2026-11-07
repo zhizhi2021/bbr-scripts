@@ -3,10 +3,10 @@
 # Algorithm references: https://github.com/google/bbr
 # No remote shell execution, automatic reboot, or kernel removal.
 
-VERSION=1.1.3
+VERSION=1.1.4
 STATE_DIR=/var/lib/bbr-script
 CONFIG=/etc/sysctl.d/99-zz-bbr-script.conf
-LOG=/var/log/bbr-script.log
+LOG=$STATE_DIR/bbr-script.log
 OS_RELEASE=/etc/os-release
 DRY_RUN=0 YES=0 AUTO_INSTALL=1
 COMMAND='' ACTION='' HOST='' IFACE='' QUEUE=fq PORT=5201 DURATION=10 STREAMS=1
@@ -53,12 +53,12 @@ BBR 管理工具：检测、预演、启用和恢复；不会自动重启。
   --compare               按相同条件依次测试 cubic / bbr，仅正向
   --reverse               测试服务端发送；算法由服务端控制，结果需核实
   --help / --version
-适配名单（2026-11-07）：Debian 13，Ubuntu 24.04 LTS/26.04/26.10，Rocky/AlmaLinux 9.8/10.2；x86_64/aarch64。
+适配名单（2026-11-07）：Debian 12 LTS/13，Ubuntu 22.04 LTS/24.04 LTS/26.04/26.10，Rocky/AlmaLinux 9.8/10.2；x86_64/aarch64。
 其他版本仅诊断；名单内也须通过能力、权限和启动检查，未承诺跨发行版真机验证。
 重复启用且配置一致时不重复写入；恢复已有记录不受适配名单变化限制，仍需 root 且不在容器。
 运行状态与配置状态分开显示。默认算法只影响新 socket，监听 socket 可能继承旧值。
 断电/SIGKILL 后需先检查并执行 restore / queue-restore / kernel recover；失败时勿盲目重启。
-状态：/var/lib/bbr-script；日志：/var/log/bbr-script.log（仅修改操作）。
+状态：/var/lib/bbr-script；日志：/var/lib/bbr-script/bbr-script.log（仅修改操作）。
 队列更换拒绝附着 filter/共享 block；fq/fq_codel 使用显式 MTU 参数，cake 限普通 Ethernet。
 内核安装保留当前内核包版本；同 ABI 覆盖更新会因版本约束而停止，不强行覆盖。
 BBRv1/v3 不凭算法名 bbr 猜测。容器不允许系统修改，可诊断、预演和测速。性能提升取决于路径与负载。
@@ -153,13 +153,14 @@ detect_system() {
     # Debian/Ubuntu: signed Debian distro-info-data 0.66+deb13u2 CSVs.
     # Rocky: https://docs.rockylinux.org/releases/ (official documentation repo).
     # Alma: https://wiki.almalinux.org/release-notes/ (official wiki repo).
-    # Ubuntu 24.04 LTS remains supported despite predating the recent-release
-    # window. VERSION_ID stays 24.04 across its point releases.
+    # Include maintained LTS releases, even outside the recent-release window:
+    # Debian 12 LTS through 2028-06; Ubuntu 22.04 standard support into 2027.
+    # Ubuntu VERSION_ID stays major.minor across point releases.
     # RPM vendors maintain only the latest minor. Unlisted releases remain
     # diagnostic-only until reviewed; no VM test implied.
     SUPPORTED=0
     case "$OS_ID:$OS_VERSION" in
-        debian:13|ubuntu:24.04|ubuntu:26.04|ubuntu:26.10|rocky:9.8|rocky:10.2|almalinux:9.8|almalinux:10.2) SUPPORTED=1 ;;
+        debian:12|debian:13|ubuntu:22.04|ubuntu:24.04|ubuntu:26.04|ubuntu:26.10|rocky:9.8|rocky:10.2|almalinux:9.8|almalinux:10.2) SUPPORTED=1 ;;
     esac
     case $ARCH in x86_64|aarch64) ;; *) SUPPORTED=0 ;; esac
     return 0
