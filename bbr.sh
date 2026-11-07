@@ -3,7 +3,7 @@
 # Algorithm references: https://github.com/google/bbr
 # No remote shell execution, automatic reboot, or kernel removal.
 
-VERSION=1.1.4
+VERSION=1.1.5
 STATE_DIR=/var/lib/bbr-script
 CONFIG=/etc/sysctl.d/99-zz-bbr-script.conf
 LOG=$STATE_DIR/bbr-script.log
@@ -789,7 +789,8 @@ log_event() {
 CONF_DIRS=(/etc/sysctl.d /run/sysctl.d /usr/local/lib/sysctl.d /usr/lib/sysctl.d /lib/sysctl.d)
 SYSCTL_CONF=/etc/sysctl.conf
 detect_conflicts() {
-    local file output found=0 number pattern line
+    local file output found=0 number pattern line value expected
+    local target_cc=${1:-bbr} target_qd=${2:-$QUEUE}
     local -a files=("$SYSCTL_CONF")
     for file in "${CONF_DIRS[@]}"; do [[ ! -d $file ]] || files+=("$file"/*.conf); done
     for file in "${files[@]}"; do
@@ -808,6 +809,17 @@ detect_conflicts() {
             # RHS intentionally unquoted: sysctl.d accepts shell-style globs.
             # shellcheck disable=SC2053 # Match sysctl glob assignments deliberately.
             if [[ net.core.default_qdisc == $pattern || net.ipv4.tcp_congestion_control == $pattern ]]; then
+                # Literal assignments already matching the requested value are
+                # compatible. Keep globs and ambiguous values conservative.
+                value=${line#*=}
+                value=${value#"${value%%[![:space:]]*}"}
+                value=${value%"${value##*[![:space:]]}"}
+                expected=''
+                case $pattern in
+                    net.core.default_qdisc) expected=$target_qd ;;
+                    net.ipv4.tcp_congestion_control) expected=$target_cc ;;
+                esac
+                if [[ -n $expected && $value == "$expected" ]]; then continue; fi
                 warn "配置冲突 $file:$number：$line"; found=1
             fi
         done <<< "$output"
@@ -1083,11 +1095,12 @@ restore_state_impl() {
         return 0
     fi
     [[ -d $STATE_DIR/baseline ]] || { say '没有可恢复的原始状态。'; return 0; }
-    check_managed_file && detect_conflicts || return 1
+    check_managed_file || return 1
     local cc qd applied_qd
     cc=$(cat "$STATE_DIR/baseline/before.cc") || return 1
     qd=$(cat "$STATE_DIR/baseline/before.qd") || return 1
     valid_value "$cc" && valid_value "$qd" || return 1
+    detect_conflicts "$cc" "$qd" || return 1
     read_pair || return 1
     # Failed enable may leave a baseline with no applied state: it is already original.
     if [[ ! -f $STATE_DIR/applied.conf ]]; then

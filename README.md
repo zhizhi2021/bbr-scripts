@@ -222,7 +222,13 @@ bash bbr.sh recovery
 | 恢复网卡队列 | `bash bbr.sh queue-restore` |
 | 恢复内核安装前默认启动项 | `bash bbr.sh kernel recover` |
 
-检测到后续人工修改时，脚本会停止覆盖。其他文件存在冲突的 sysctl 配置时，需要先手动核对；脚本不会批量删除它们。
+检测到后续人工修改时，脚本会停止覆盖。其他文件中的同名 sysctl 参数与本次目标值相同时允许继续，原文件保持不变；值不同或使用通配符等无法安全确认的配置仍需手动核对。恢复时按原始目标值重新检查，脚本不会批量删除这些配置。
+
+例如系统已通过 `10-bufferbloat.conf` 设置 `fq_codel`，可保留该队列，仅启用 BBR：
+
+```bash
+bash bbr.sh enable --auto --qdisc fq_codel
+```
 
 若第一次 `restore` 恢复了中断事务，按输出提示再次执行，才能回到首次启用前的原始状态。
 
