@@ -3,7 +3,7 @@
 # Algorithm references: https://github.com/google/bbr
 # No remote shell execution, automatic reboot, or kernel removal.
 
-VERSION=1.1.6
+VERSION=1.1.7
 STATE_DIR=/var/lib/bbr-script
 CONFIG=/etc/sysctl.d/99-zz-bbr-script.conf
 LOG=$STATE_DIR/bbr-script.log
@@ -415,10 +415,8 @@ show_change_plan() {
     apply_device_defaults || return 1
     detect_capabilities
     ui_heading '配置变更'
-    ui_field '新连接算法' "${CURRENT_CC:-未知} → bbr"
-    if [[ ${CURRENT_QDISC:-} == "$QUEUE" ]]; then
-        ui_field '默认队列' "$QUEUE（保持不变）"
-    else ui_field '默认队列' "${CURRENT_QDISC:-未知} → $QUEUE"; fi
+    ui_change '新连接算法' "${CURRENT_CC:-}" bbr
+    ui_change '默认队列' "${CURRENT_QDISC:-}" "$QUEUE"
     (( ! QUEUE_EXPLICIT )) || ui_field '队列来源' '手动指定（优先于设备建议）'
     ui_field '实际网卡队列' '本次不替换'
     ui_heading '执行范围'
@@ -477,13 +475,13 @@ ui_device_menu() {
 }
 
 # Terminal UI: no extra dependencies; redirected output stays plain text.
-UI_BOLD='' UI_CYAN='' UI_GREEN='' UI_YELLOW='' UI_RESET=''
+UI_BOLD='' UI_CYAN='' UI_GREEN='' UI_YELLOW='' UI_RED='' UI_RESET=''
 UI_INPUT=''
 ui_init() {
-    UI_BOLD='' UI_CYAN='' UI_GREEN='' UI_YELLOW='' UI_RESET=''
+    UI_BOLD='' UI_CYAN='' UI_GREEN='' UI_YELLOW='' UI_RED='' UI_RESET=''
     if [[ -t 1 && ${TERM:-dumb} != dumb && -z ${NO_COLOR+x} ]]; then
         UI_BOLD=$'\033[1m'; UI_CYAN=$'\033[36m'; UI_GREEN=$'\033[32m'
-        UI_YELLOW=$'\033[33m'; UI_RESET=$'\033[0m'
+        UI_YELLOW=$'\033[33m'; UI_RED=$'\033[31m'; UI_RESET=$'\033[0m'
     fi
 }
 ui_width() {
@@ -495,9 +493,9 @@ ui_width() {
     printf '%s' "$width"
 }
 ui_rule() {
-    local line
+    local line mark=${1:--}
     printf -v line '%*s' "$(ui_width)" ''
-    printf '%s%s%s\n' "$UI_CYAN" "${line// /-}" "$UI_RESET"
+    printf '%s%s%s\n' "$UI_CYAN" "${line// /$mark}" "$UI_RESET"
 }
 ui_heading() { printf '\n%s[%s]%s\n' "$UI_BOLD" "$1" "$UI_RESET"; }
 ui_field() {
@@ -506,6 +504,51 @@ ui_field() {
     if (( $(ui_width) < 50 && ${#value} > 22 )); then
         printf '  %s：\n    %s\n' "$label" "$value"
     else printf '  %s：%s\n' "$label" "$value"; fi
+}
+ui_banner() {
+    local status=$1 title=$2 color=$UI_GREEN
+    case $status in 未完成|校验不完整) color=$UI_RED ;; 预演结束|无需修改) color=$UI_YELLOW ;; esac
+    say ''; ui_rule '='
+    printf '%s%s[%s] %s%s\n' "$UI_BOLD" "$color" "$status" "$title" "$UI_RESET"
+    ui_rule '='
+}
+ui_change() {
+    local label=$1 before=$2 after=$3 phase=${4:-plan} mark color=$UI_YELLOW
+    if [[ -z $before || -z $after ]]; then mark=无法核实
+    elif [[ $before == "$after" ]]; then mark=保持不变; color=$UI_CYAN
+    elif [[ $phase == actual ]]; then mark=已修改; color=$UI_GREEN
+    elif [[ $phase == observed ]]; then mark=检测到变化
+    else mark=将修改; fi
+    printf '  %s[%s]%s %s\n' "$color" "$mark" "$UI_RESET" "$label"
+    if [[ -n $before && $before == "$after" ]]; then printf '    %s\n' "$after"
+    else printf '    %s → %s\n' "${before:-无法读取}" "${after:-无法读取}"; fi
+}
+config_result() {
+    local title=$1 before_cc=$2 before_qd=$3 target_cc=$4 target_qd=$5 mode=${6:-changed}
+    local after_cc after_qd
+    after_cc=$(sys_value net.ipv4.tcp_congestion_control) || after_cc=''
+    after_qd=$(sys_value net.core.default_qdisc) || after_qd=''
+    if [[ $after_cc != "$target_cc" || $after_qd != "$target_qd" ]]; then
+        ui_banner '校验不完整' "$title"
+        ui_change '默认 TCP' "$before_cc" "$after_cc" observed
+        ui_change '默认队列' "$before_qd" "$after_qd" observed
+        warn '最终运行值与目标不一致或无法读取；请检查状态及恢复记录。'
+        return 1
+    fi
+    if [[ $mode == unchanged ]]; then ui_banner '无需修改' "$title"
+    else ui_banner '执行成功' "$title"; fi
+    ui_change '默认 TCP' "$before_cc" "$after_cc" actual
+    ui_change '默认队列' "$before_qd" "$after_qd" actual
+    say '  [已校验] 以上为操作后实际读取的运行值。'
+    if [[ -r $CONFIG ]]; then
+        case $mode in
+            unchanged) ui_field '[保持不变] 配置文件' "$CONFIG" ;;
+            restored) ui_field '[已恢复] 配置文件' "$CONFIG" ;;
+            *) ui_field '[已写入] 配置文件' "$CONFIG" ;;
+        esac
+    else say '  [配置状态] 本脚本的持久配置文件当前不存在。'; fi
+    say '  [保持不变] 当前网卡队列；系统未重启。'
+    say '  生效范围：新连接；已有监听 socket 可能沿用旧值。'
 }
 ui_read() {
     local prompt=$1 default=${2:-}
@@ -525,17 +568,35 @@ ui_pause() {
     IFS= read -r _ || return 0
 }
 ui_run() {
-    local title=$1 rc=0
+    local title=$1 rc=0 before_cc='' before_qd='' after_cc='' after_qd='' action=${2:-}
     shift
     ui_heading "$title"
-    # Per-action isolation keeps menu parameters and traps out of later actions.
+    if [[ $action == enable_bbr || $action == restore_state ]]; then
+        before_cc=$(sys_value net.ipv4.tcp_congestion_control) || before_cc=''
+        before_qd=$(sys_value net.core.default_qdisc) || before_qd=''
+    fi
+    # Per-action isolation lets rollback traps finish before the failure summary.
     ( "$@" ) || rc=$?
     if (( rc == 0 )); then
-        if (( DRY_RUN )); then printf '\n%s[预演结束]%s 未执行修改或测速。\n' "$UI_GREEN" "$UI_RESET"
-        else printf '\n%s[完成]%s %s\n' "$UI_GREEN" "$UI_RESET" "$title"; fi
+        if (( DRY_RUN )); then
+            ui_banner '预演结束' "$title"
+            say '  [未执行] 未修改配置、加载模块或发起测速。'
+        elif [[ $action != enable_bbr && $action != restore_state ]]; then
+            ui_banner '执行成功' "$title"
+        fi
     else
-        printf '\n%s[未完成]%s %s\n' "$UI_YELLOW" "$UI_RESET" "$title"
-        printf '  退出码：%s\n  请查看上方原因，处理后重试。\n' "$rc"
+        ui_banner '未完成' "$title"
+        ui_field '退出码' "$rc"
+        if [[ $action == enable_bbr || $action == restore_state ]] && (( ! DRY_RUN )); then
+            after_cc=$(sys_value net.ipv4.tcp_congestion_control) || after_cc=''
+            after_qd=$(sys_value net.core.default_qdisc) || after_qd=''
+            ui_heading '当前实际状态（操作结束后读取）'
+            ui_change '默认 TCP' "$before_cc" "$after_cc" observed
+            ui_change '默认队列' "$before_qd" "$after_qd" observed
+            say '  运行值相同不代表所有文件均已恢复。'
+            ui_field '恢复记录' "$STATE_DIR"
+        fi
+        say '  请查看上方原因，处理后重试。'
     fi
     ui_pause
     return "$rc"
@@ -1126,8 +1187,8 @@ enable_bbr_impl() {
     if (( AUTO )); then show_change_plan || return 1
     else
         ui_heading '配置变更'
-        ui_field '新连接算法' "${CURRENT_CC:-未知} → bbr"
-        ui_field '默认队列' "${CURRENT_QDISC:-未知} → $QUEUE"
+        ui_change '新连接算法' "${CURRENT_CC:-}" bbr
+        ui_change '默认队列' "${CURRENT_QDISC:-}" "$QUEUE"
         say '  保留当前网卡队列、TCP 缓冲区和内核，不自动重启。'
     fi
     require_mutation || return 1
@@ -1136,17 +1197,17 @@ enable_bbr_impl() {
     [[ ! -e $STATE_DIR/transaction ]] || { fail '存在未完成事务，请运行 restore。'; return 1; }
     check_managed_file && detect_conflicts && ensure_modules || return 1
     read_pair || return 1
+    local result_cc=$PAIR_CC result_qd=$PAIR_QD
     if [[ -f $STATE_DIR/applied.conf && -f $STATE_DIR/applied.qd && $PAIR_CC == bbr && $PAIR_QD == "$QUEUE" ]] &&
         [[ $(cat "$STATE_DIR/applied.qd") == "$QUEUE" ]] && cmp -s "$CONFIG" <(render_config bbr "$QUEUE"); then
         valid_snapshot "$STATE_DIR/baseline" || { fail '原始备份不完整，拒绝跳过检查'; return 1; }
-        say '当前运行参数和本脚本持久配置已一致，无需重复修改。'; return 0
+        config_result 'BBR 配置已一致' "$result_cc" "$result_qd" bbr "$QUEUE" unchanged; return $?
     fi
     begin_transaction bbr "$QUEUE" || return 1
     log_event "enable begin qdisc=$QUEUE" || return 1
     write_managed_config && set_pair bbr "$QUEUE" || return 1
     finish_transaction enable || return 1
-    say 'BBR 默认配置已启用并读回校验；实际网卡队列保持原状。'
-    say '可运行 doctor 检查 socket；已有连接/监听 socket 不保证切换。'
+    config_result 'BBR 配置已启用' "$result_cc" "$result_qd" bbr "$QUEUE"
 }
 restore_state() ( restore_state_impl )
 restore_state_impl() {
@@ -1159,10 +1220,13 @@ restore_state_impl() {
     if [[ -d $TX_DIR ]]; then
         rollback_transaction || return 1
         log_event 'recovered interrupted transaction' || return 1
-        say '已恢复中断事务前的状态；如需恢复第一次启用前状态，再运行 restore。'
+        ui_banner '执行成功' '中断事务已恢复'
+        ui_field '默认 TCP' "$(sys_value net.ipv4.tcp_congestion_control || printf '无法读取')"
+        ui_field '默认队列' "$(sys_value net.core.default_qdisc || printf '无法读取')"
+        say '  如需恢复第一次启用前的状态，再运行 restore。'
         return 0
     fi
-    [[ -d $STATE_DIR/baseline ]] || { say '没有可恢复的原始状态。'; return 0; }
+    [[ -d $STATE_DIR/baseline ]] || { ui_banner '无需修改' '没有可恢复的原始状态'; return 0; }
     check_managed_file || return 1
     local cc qd applied_qd
     cc=$(cat "$STATE_DIR/baseline/before.cc") || return 1
@@ -1170,10 +1234,11 @@ restore_state_impl() {
     valid_value "$cc" && valid_value "$qd" || return 1
     detect_conflicts "$cc" "$qd" || return 1
     read_pair || return 1
+    local result_cc=$PAIR_CC result_qd=$PAIR_QD
     # Failed enable may leave a baseline with no applied state: it is already original.
     if [[ ! -f $STATE_DIR/applied.conf ]]; then
         [[ $PAIR_CC == "$cc" && $PAIR_QD == "$qd" ]] || { fail '运行参数已改变，拒绝覆盖'; return 1; }
-        say '原状态未改变，无需恢复。'; return 0
+        config_result '原状态未改变' "$result_cc" "$result_qd" "$cc" "$qd" unchanged; return $?
     fi
     applied_qd=$(cat "$STATE_DIR/applied.qd") || return 1
     [[ $PAIR_CC == bbr && $PAIR_QD == "$applied_qd" ]] || { fail '运行参数已被外部修改，拒绝覆盖。'; return 1; }
@@ -1181,7 +1246,7 @@ restore_state_impl() {
     log_event 'restore begin' || return 1
     write_managed_config && set_pair "$cc" "$qd" || return 1
     finish_transaction restore || return 1
-    say '已恢复原配置与原运行参数；备份已归档，未修改其他网络设置。'
+    config_result '原配置与运行参数已恢复' "$result_cc" "$result_qd" "$cc" "$qd" restored
 }
 
 probe_tcp() {
@@ -1445,7 +1510,15 @@ set_queue_impl() {
     mv -T -- "$STATE_DIR/queue.pending" "$STATE_DIR/queue-state" || return 1
     QUEUE_ACTIVE=0; trap - EXIT INT TERM HUP
     log_event "queue completed interface=$IFACE qdisc=$QUEUE" || warn '队列已设置但日志失败'
-    say "已验证 $IFACE 根队列为 $QUEUE；重启后不自动重建。可用 queue-restore 恢复。"
+    local previous_kind
+    previous_kind=$(python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["kind"])' < "$STATE_DIR/queue-state/before.json") || previous_kind=''
+    ui_heading '网卡队列结果'
+    ui_field '网卡' "$IFACE"
+    ui_change '根队列算法' "$previous_kind" "$QUEUE" actual
+    say '  [已更新] 队列参数已与目标快照读回比对。'
+    say '  [保持不变] 默认 TCP 算法、系统启动配置。'
+    say '  生效范围：本次运行；重启后不自动重建。'
+    ui_field '恢复命令' 'bash bbr.sh queue-restore'
 }
 restore_queue() ( restore_queue_impl )
 restore_queue_impl() {
@@ -1805,8 +1878,13 @@ kernel_install_impl() {
     trap - EXIT INT TERM HUP
     (( rc == 0 )) || { fail "内核包事务失败，退出码 $rc；未自动删除部分安装内容，请检查包管理器状态。"; return "$rc"; }
     log_event 'kernel package transaction completed; old boot entry retained' || warn '日志失败'
-    say '内核包安装完成，原默认启动项已保留。请通过控制台选择新内核测试，再运行 kernel verify。'
-    say '未重启，未证明新内核已可启动，也未证明存在 BBRv3。'
+    ui_heading '内核安装结果'
+    ui_field '软件包' "$package"
+    say '  [已完成] 内核软件包安装事务。'
+    ui_change '运行内核' "$(cat "$STATE_DIR/kernel-before" 2>/dev/null || :)" "$(uname -r)" actual
+    say '  [已保留] 原默认启动项；系统未重启。'
+    say '  [待验证] 新内核能否启动及 BBR 实现版本。'
+    say '  下一步：通过控制台选择新内核，再运行 kernel verify。'
 }
 kernel_command() {
     case ${ACTION:-plan} in list|plan|install|verify|recover) ;; *) fail '未知 kernel 子命令'; return 2 ;; esac
