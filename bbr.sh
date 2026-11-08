@@ -3,7 +3,7 @@
 # Algorithm references: https://github.com/google/bbr
 # No remote shell execution or kernel removal. Kernel install can reboot.
 
-VERSION=1.2.0
+VERSION=1.2.1
 STATE_DIR=/var/lib/bbr-script
 CONFIG=/etc/sysctl.d/99-zz-bbr-script.conf
 LOG=$STATE_DIR/bbr-script.log
@@ -1296,7 +1296,14 @@ doctor() {
     done
     probe_tcp || rc=1
     if has ss; then say '现有 TCP 连接（算法与统计由 ss 输出）：'; ss -tin || rc=1; fi
-    detect_conflicts || rc=1
+    # Diagnose persistence against the observed running values, not enable's
+    # bbr/fq defaults. Missing values must not silently fall back to those defaults.
+    if valid_value "${CURRENT_CC:-}" && valid_value "${CURRENT_QDISC:-}"; then
+        detect_conflicts "$CURRENT_CC" "$CURRENT_QDISC" || rc=1
+    else
+        fail '无法核对持久配置：当前算法或默认队列未可靠读取。'
+        rc=1
+    fi
     return "$rc"
 }
 # Print one tc argument per line; no eval and no shell-generated commands.
