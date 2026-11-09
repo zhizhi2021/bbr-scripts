@@ -21,7 +21,7 @@ BENCH_INTERRUPTED=0
 # Piped or dumb output keeps the plain ASCII forms.
 UI_CARD=0 UI_CARD_INNER=0 QUICK_CPUS='' QUICK_MEM_KB=''
 UI_BAR_ON='#' UI_BAR_OFF='-' UI_ICON_OK='[OK]' UI_ICON_NO='[NG]' UI_ICON_WARN='[!]'
-UI_ICON_NOTE='>' UI_ICON_INFO='-' UI_SEP='|' UI_RULE_FILL='-'
+UI_ICON_INFO='-' UI_SEP='|' UI_RULE_FILL='-'
 UI_CARD_TOP='+-' UI_CARD_SIDE='|' UI_CARD_BOTTOM='+-' UI_ENDCAP_TOP='+' UI_ENDCAP_BOTTOM='+'
 
 say() { printf '%s\n' "$*"; }
@@ -446,7 +446,7 @@ if sys.argv[1]=="full":
  print("  队列预算：%.2f MiB（上限 32 MiB）"%(qb/1048576.0))
 for n in d["notes"]:print("  提示："+n)
 if sys.argv[1]=="full":
- print("  ▸ 设备资源不能推算线路带宽或 RTT" if cols<50 else "  ▸ 设备资源不能推算线路带宽或 RTT；CPU/内存只用于挑建议值。")
+ print("  设备资源不能推算线路带宽或 RTT")
 sys.exit(not d["complete"])' "$detail" "$UI_BAR_ON" "$UI_BAR_OFF" "$(ui_width)" "$UI_GREEN" "$UI_YELLOW" "$UI_RED" "$UI_RESET" <<< "$json" || return 1
     if [[ -n $IFACE ]] && has ip; then ip -o link show dev "$IFACE" || return 1; fi
 }
@@ -464,10 +464,10 @@ show_change_plan() {
     ui_heading '执行范围'
     if (( $(ui_width) >= 50 )); then
         say '  会改：新连接的加速算法与排队方式；会写：配置文件与原始备份。'
-        say '  不会动：缓冲区、连接数、内核。执行前会等你确认。'
+        say '  不会动：缓冲区、连接数、内核。'
         say "  配置文件：$CONFIG"
         say "  原始备份：$STATE_DIR/baseline"
-        (( ! AUTO )) || say "  队列预算：$(awk -v b="$DEVICE_BUDGET" 'BEGIN{printf "%.2f MiB", b/1048576}')（只在 queue --auto 用）"
+        (( ! AUTO )) || say "  队列预算：$(awk -v b="$DEVICE_BUDGET" 'BEGIN{printf "%.2f MiB", b/1048576}')"
     else
         say '  会改：加速算法与排队方式'
         say '  会写：配置文件与原始备份'
@@ -505,8 +505,6 @@ recovery_center() {
         valid_snapshot "$STATE_DIR/baseline" || { fail '原始备份不完整，请核对历史快照，勿盲目覆盖。'; return 1; }
     fi
     [[ ! -d $STATE_DIR/queue-state ]] || say '  ! 存在队列恢复快照：bash bbr.sh queue-restore'
-    if (( $(ui_width) >= 50 )); then ui_note '历史记录在 *-history.* 等目录下，不会自动覆盖当前配置'
-    else ui_note '历史记录见 *-history.* 等目录'; fi
 }
 ui_device_menu() {
     local AUTO=1 QUEUE=$QUEUE QUEUE_EXPLICIT=$QUEUE_EXPLICIT
@@ -532,7 +530,7 @@ ui_init() {
     UI_CARD=0
     if [[ -t 1 && ${TERM:-dumb} != dumb ]]; then
         UI_BAR_ON='█' UI_BAR_OFF='░' UI_ICON_OK='✓' UI_ICON_NO='✗'
-        UI_ICON_WARN='!' UI_ICON_NOTE='▸' UI_ICON_INFO='·' UI_SEP='·' UI_RULE_FILL='─'
+        UI_ICON_WARN='!' UI_ICON_INFO='·' UI_SEP='·' UI_RULE_FILL='─'
         UI_CARD_TOP='┌─' UI_CARD_SIDE='│' UI_CARD_BOTTOM='└─' UI_ENDCAP_TOP='┐' UI_ENDCAP_BOTTOM='┘'
     fi
     if [[ -t 1 && ${TERM:-dumb} != dumb && -z ${NO_COLOR+x} ]]; then
@@ -623,10 +621,6 @@ ui_cell() {
     (( pad >= 0 )) || pad=0
     printf '  %s%s%s %s%*s %s%s%s\n' "$UI_CYAN" "$UI_CARD_SIDE" "$UI_RESET" "$text" \
         "$pad" '' "$UI_CYAN" "$UI_CARD_SIDE" "$UI_RESET"
-}
-ui_note() {
-    if (( UI_CARD )); then ui_cell "$UI_ICON_NOTE $1"; return 0; fi
-    printf '  %s%s %s%s\n' "$UI_CYAN" "$UI_ICON_NOTE" "$1" "$UI_RESET"
 }
 # <ok|no|warn|info> <text>
 ui_check() {
