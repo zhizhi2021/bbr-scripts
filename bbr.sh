@@ -417,6 +417,7 @@ d=json.load(sys.stdin)
 on=sys.argv[2] if len(sys.argv)>2 else "#"
 off=sys.argv[3] if len(sys.argv)>3 else "-"
 cols=int(sys.argv[4]) if len(sys.argv)>4 else 64
+green=sys.argv[5]; yellow=sys.argv[6]; red=sys.argv[7]; reset=sys.argv[8]
 bw=max(8,min(18,cols-34))
 def bar(cur,mx,width=0):
     width=width or bw
@@ -424,22 +425,29 @@ def bar(cur,mx,width=0):
     except (TypeError,ValueError,ZeroDivisionError):return off*width
     n=max(0,min(width,n))
     return on*n+off*(width-n)
+def tint(p):
+    # Green while there is headroom, yellow near the limit, red past it.
+    if not (green or yellow or red): return ""
+    if p>=90: return red
+    if p>=70: return yellow
+    return green
 eff=d["effective_cpus"];log=d["logical_cpus"]
 me=d["memory_limit_bytes"];ma=d["memory_available_bytes"]
-pct=(100.0*ma/me) if me else 0
-mem="%.1f / %.1f GiB"%(ma/1073741824.0,me/1073741824.0)
-if cols>=50:mem+="（%.0f%% 可用）"%pct
-print("  CPU：%s  %g / %s 核（有效/可见）"%(bar(eff,log),eff,log))
-print("  内存：%s  %s"%(bar(ma,me),mem))
+used=max(0,me-ma)
+pct=(100.0*used/me) if me else 0
+print("  CPU：%g / %s 核（有效 / 可见）"%(eff,log))
+if cols>=50:
+ print("  内存：%s%s%s  %.1f / %.1f GiB 已用（可用 %.1f GiB）"%(tint(pct),bar(used,me),reset,used/1073741824.0,me/1073741824.0,ma/1073741824.0))
+else:
+ print("  内存：%s%s%s  %.0f%% 已用"%(tint(pct),bar(used,me),reset,pct))
 print("  建议队列：%s   测试并发：1 / %s 流"%(d["recommended_qdisc"],d["pressure_streams"]))
 if sys.argv[1]=="full":
  qb=d["queue_budget_bytes"]
- qt="%.2f MiB（上限 32 MiB）"%(qb/1048576.0) if cols>=50 else "%.2f MiB"%(qb/1048576.0)
- print("  队列预算：%s  %s"%(bar(qb,32*1024**2),qt))
+ print("  队列预算：%.2f MiB（上限 32 MiB）"%(qb/1048576.0))
 for n in d["notes"]:print("  提示："+n)
 if sys.argv[1]=="full":
  print("  ▸ 设备资源不能推算线路带宽或 RTT" if cols<50 else "  ▸ 设备资源不能推算线路带宽或 RTT；CPU/内存只用于挑建议值。")
-sys.exit(not d["complete"])' "$detail" "$UI_BAR_ON" "$UI_BAR_OFF" "$(ui_width)" <<< "$json" || return 1
+sys.exit(not d["complete"])' "$detail" "$UI_BAR_ON" "$UI_BAR_OFF" "$(ui_width)" "$UI_GREEN" "$UI_YELLOW" "$UI_RED" "$UI_RESET" <<< "$json" || return 1
     if [[ -n $IFACE ]] && has ip; then ip -o link show dev "$IFACE" || return 1; fi
 }
 show_change_plan() {
