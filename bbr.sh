@@ -189,7 +189,7 @@ inspect_qdiscs() {
     if has tc; then tc qdisc show; else fail '缺少 tc（iproute2），无法检查实际网卡队列。'; return 1; fi
 }
 show_status() {
-    local rc=0 qdiscs=''
+    local rc=0 qdiscs='' qdisc_lines=''
     detect_system; detect_capabilities
     ui_quick_facts
     ui_heading "系统状态 $UI_SEP v$VERSION"
@@ -205,13 +205,14 @@ show_status() {
     else say '  持久配置：未由本脚本管理'; fi
     (( SUPPORTED )) || say '  适配名单：未匹配（只能诊断与预演）'
     if has tc; then
-        qdiscs=$(tc qdisc show 2>/dev/null | awk '$1=="qdisc"{k=$2; for(i=1;i<=NF;i++) if($i=="dev"){printf "%s%s %s", n++?" · ":"", $(i+1), k; break}}')
+        qdisc_lines=$(tc qdisc show 2>/dev/null | awk '$1=="qdisc"{k=$2; for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1) " " k; break}}')
+        qdiscs=$(printf '%s\n' "$qdisc_lines" | awk -v sep=" $UI_SEP " 'NF{printf "%s%s", n++?sep:"", $0}')
         if [[ -n $qdiscs ]]; then
             if (( $(ui_dw "  实际网卡队列：$qdiscs") <= $(ui_width) )); then
                 say "  实际网卡队列：$qdiscs"
             else
                 say '  实际网卡队列：'
-                printf '%s\n' "$qdiscs" | tr '·' '\n' | sed -e 's/^ *//' -e '/^$/d' -e 's/^/    /'
+                printf '%s\n' "$qdisc_lines" | sed -e 's/^/    /'
             fi
         else say '  实际网卡队列：无法读取'; rc=1; fi
     else fail '缺少 tc（iproute2），无法检查实际网卡队列。'; rc=1; fi
@@ -433,7 +434,7 @@ me=d["memory_limit_bytes"];ma=d["memory_available_bytes"]
 used=max(0,me-ma)
 pct=(100.0*used/me) if me else 0
 print("  CPU：%g / %s 核（有效 / 可见）"%(eff,log))
-if cols>=50:
+if cols>=64:
  print("  内存：%s%s%s  %.1f / %.1f GiB 已用（可用 %.1f GiB）"%(tint(pct),bar(used,me),reset,used/1073741824.0,me/1073741824.0,ma/1073741824.0))
 else:
  print("  内存：%s%s%s  %.0f%% 已用"%(tint(pct),bar(used,me),reset,pct))
@@ -457,7 +458,7 @@ show_change_plan() {
     ui_field '实际网卡队列' '本次不替换'
     ui_card_end
     ui_heading '执行范围'
-    if (( $(ui_width) >= 50 )); then
+    if (( $(ui_width) >= 64 )); then
         say '  会改：新连接的加速算法与排队方式；会写：配置文件与原始备份。'
         say '  不会动：缓冲区、连接数、内核。'
         say "  配置文件：$CONFIG"
@@ -484,22 +485,22 @@ show_queue_plan() {
 }
 recovery_center() {
     say '恢复与排障中心（只读）'
-    if (( $(ui_width) >= 50 )); then say "  状态目录：$STATE_DIR（日志 bbr-script.log）"
+    if (( $(ui_width) >= 64 )); then say "  状态目录：$STATE_DIR（日志 bbr-script.log）"
     else say "  状态目录：$STATE_DIR"; fi
     if [[ -d $STATE_DIR && ! -x $STATE_DIR ]]; then fail '当前用户无读取权限，请以 root 查看恢复记录。'; return 1; fi
     local pending=0
-    if [[ -d $STATE_DIR/transaction ]]; then say '  ! 配置事务未完成：bash bbr.sh restore'; pending=1; fi
+    if [[ -d $STATE_DIR/transaction ]]; then say "  $UI_ICON_WARN 配置事务未完成：bash bbr.sh restore"; pending=1; fi
     if [[ -d $STATE_DIR/kernel.pending ]]; then
-        if [[ -f $STATE_DIR/kernel.pending/target-version ]]; then say '  ! 内核切换待确认：bash bbr.sh kernel verify（回退用 kernel recover）'
-        else say '  ! 内核事务未完成：bash bbr.sh kernel recover'; fi
+        if [[ -f $STATE_DIR/kernel.pending/target-version ]]; then say "  $UI_ICON_WARN 内核切换待确认：bash bbr.sh kernel verify（回退用 kernel recover）"
+        else say "  $UI_ICON_WARN 内核事务未完成：bash bbr.sh kernel recover"; fi
         pending=1
     fi
-    if [[ -d $STATE_DIR/queue.pending ]]; then say '  ! 队列事务未完成：bash bbr.sh queue-restore'; pending=1; fi
-    (( pending )) || say '  ✓ 没有未完成事务。'
+    if [[ -d $STATE_DIR/queue.pending ]]; then say "  $UI_ICON_WARN 队列事务未完成：bash bbr.sh queue-restore"; pending=1; fi
+    (( pending )) || say "  $UI_ICON_OK 没有未完成事务。"
     if [[ -d $STATE_DIR/baseline ]]; then
         valid_snapshot "$STATE_DIR/baseline" || { fail '原始备份不完整，请核对历史快照，勿盲目覆盖。'; return 1; }
     fi
-    [[ ! -d $STATE_DIR/queue-state ]] || say '  ! 存在队列恢复快照：bash bbr.sh queue-restore'
+    [[ ! -d $STATE_DIR/queue-state ]] || say "  $UI_ICON_WARN 存在队列恢复快照：bash bbr.sh queue-restore"
 }
 ui_device_menu() {
     local AUTO=1 QUEUE=$QUEUE QUEUE_EXPLICIT=$QUEUE_EXPLICIT
@@ -792,7 +793,7 @@ ui_run() {
 ui_overview() {
     detect_system; detect_capabilities
     say ''
-    if (( $(ui_width) >= 50 )); then
+    if (( $(ui_width) >= 64 )); then
         printf '%sBBR 管理工具 v%s%s  %s  %s %s 加速 %s\n' "$UI_BOLD" "$VERSION" "$UI_RESET" \
             "$UI_SEP" "$OS_ID $OS_VERSION" "$UI_SEP" "$(ui_plain_cc "${CURRENT_CC:-}")"
     else
@@ -804,9 +805,9 @@ ui_overview() {
     elif (( ! SUPPORTED )); then say '  此系统不在适配名单：只能诊断与预演'
     elif (( EUID != 0 )); then say '  普通用户：系统修改需 root'
     else say '  root：修改前会显示说明并确认'; fi
-    [[ ! -d $STATE_DIR/transaction ]] || say '  ! 有未完成的配置修改：进入「恢复与排障」'
-    [[ ! -d $STATE_DIR/queue.pending ]] || say '  ! 有未完成的队列修改：进入「恢复与排障」'
-    [[ ! -d $STATE_DIR/kernel.pending ]] || say '  ! 有未完成的内核操作：进入「高级设置 → 内核」'
+    [[ ! -d $STATE_DIR/transaction ]] || say "  $UI_ICON_WARN 有未完成的配置修改：进入「恢复与排障」"
+    [[ ! -d $STATE_DIR/queue.pending ]] || say "  $UI_ICON_WARN 有未完成的队列修改：进入「恢复与排障」"
+    [[ ! -d $STATE_DIR/kernel.pending ]] || say "  $UI_ICON_WARN 有未完成的内核操作：进入「高级设置 → 内核」"
 }
 ui_ask() {
     local dest=$1 label=$2 kind=$3 default=${4:-} valid
