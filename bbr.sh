@@ -19,10 +19,10 @@ BEFORE='' AFTER='' DEVICE_JSON='' DEVICE_QUEUE=fq DEVICE_BUDGET=0 DEVICE_STREAMS
 BENCH_INTERRUPTED=0
 # Visual vocabulary; ui_init() upgrades these to box glyphs on a terminal.
 # Piped or dumb output keeps the plain ASCII forms.
-UI_CARD=0 QUICK_CPUS='' QUICK_MEM_KB=''
+UI_CARD=0 UI_CARD_INNER=0 QUICK_CPUS='' QUICK_MEM_KB=''
 UI_BAR_ON='#' UI_BAR_OFF='-' UI_ICON_OK='[OK]' UI_ICON_NO='[NG]' UI_ICON_WARN='[!]'
 UI_ICON_NOTE='>' UI_ICON_INFO='-' UI_SEP='|' UI_RULE_FILL='-'
-UI_CARD_TOP='+-' UI_CARD_SIDE='|' UI_CARD_BOTTOM='+-'
+UI_CARD_TOP='+-' UI_CARD_SIDE='|' UI_CARD_BOTTOM='+-' UI_ENDCAP_TOP='+' UI_ENDCAP_BOTTOM='+'
 
 say() { printf '%s\n' "$*"; }
 warn() { printf '提示：%s\n' "$*" >&2; }
@@ -199,7 +199,8 @@ show_status() {
     ui_field '重启以后' "$(ui_restart_expect)"
     ui_card_end
     ui_note '只影响新连接；已有连接要重连。'
-    ui_heading '运行参数（原始读数，排障用）'
+    ui_heading '运行参数'
+    ui_note '原始读数，排障时用'
     ui_field '系统' "$OS_ID $OS_VERSION / $ARCH"
     ui_field '虚拟化' "$VIRT"
     ui_field '内核' "$(uname -r)"
@@ -512,11 +513,8 @@ recovery_center() {
     fi
     [[ ! -d $STATE_DIR/queue-state ]] || ui_check ok '存在队列恢复快照：bash bbr.sh queue-restore'
     ui_card_end
-    ui_note '历史记录在状态目录下'
-    ui_note '*-history.* / *-restored.*'
-    ui_note '不会用旧记录覆盖当前配置。'
-    ui_note '恢复前会核对人工修改。'
-    ui_note '换内核中断时先确认启动项。'
+    ui_note '历史记录在 *-history.* 等目录下'
+    ui_note '不会自动用旧记录覆盖当前配置'
 }
 ui_device_menu() {
     local AUTO=1 QUEUE=$QUEUE QUEUE_EXPLICIT=$QUEUE_EXPLICIT
@@ -543,7 +541,7 @@ ui_init() {
     if [[ -t 1 && ${TERM:-dumb} != dumb ]]; then
         UI_BAR_ON='█' UI_BAR_OFF='░' UI_ICON_OK='✓' UI_ICON_NO='✗'
         UI_ICON_WARN='!' UI_ICON_NOTE='▸' UI_ICON_INFO='·' UI_SEP='·' UI_RULE_FILL='─'
-        UI_CARD_TOP='┌─' UI_CARD_SIDE='│' UI_CARD_BOTTOM='└─'
+        UI_CARD_TOP='┌─' UI_CARD_SIDE='│' UI_CARD_BOTTOM='└─' UI_ENDCAP_TOP='┐' UI_ENDCAP_BOTTOM='┘'
     fi
     if [[ -t 1 && ${TERM:-dumb} != dumb && -z ${NO_COLOR+x} ]]; then
         UI_BOLD=$'\033[1m'; UI_CYAN=$'\033[36m'; UI_GREEN=$'\033[32m'
@@ -565,34 +563,71 @@ ui_rule() {
 }
 ui_heading() { printf '\n%s[%s]%s\n' "$UI_BOLD" "$1" "$UI_RESET"; }
 # <title> [title display width, default 8 for four CJK glyphs]
+# Display width: CJK and fullwidth take two columns; box/arrow/block glyphs
+# take one. LC_ALL=C makes ${#s} a byte count, so decode UTF-8 by hand.
+ui_dw() {
+    local s=$1 i=0 n=${#1} b b2 b3 cp w=0
+    while (( i < n )); do
+        b=$(printf '%d' "'${s:i:1}" 2>/dev/null) || b=63
+        if (( b < 128 )); then w=$((w+1)); i=$((i+1))
+        elif (( b < 224 )); then w=$((w+1)); i=$((i+2))
+        elif (( b < 240 )); then
+            b2=$(printf '%d' "'${s:i+1:1}" 2>/dev/null) || b2=0
+            b3=$(printf '%d' "'${s:i+2:1}" 2>/dev/null) || b3=0
+            cp=$(( ((b & 15) << 12) | ((b2 & 63) << 6) | (b3 & 63) ))
+            if (( cp >= 0x2E80 )); then w=$((w+2)); else w=$((w+1)); fi
+            i=$((i+3))
+        else w=$((w+2)); i=$((i+4)); fi
+    done
+    printf '%s' "$w"
+}
+ui_fill() {
+    local n=${1:-0} out
+    (( n > 0 )) || n=0
+    printf -v out '%*s' "$n" ''
+    printf '%s' "${out// /$UI_RULE_FILL}"
+}
+# A card is only drawn when there is room for a readable inner width.
 ui_card_begin() {
-    local title=$1 dw=${2:-8} line
-    printf -v line '%*s' "$(( $(ui_width) - 6 - dw ))" ''
-    (( ${#line} >= 2 )) || line='  '
-    printf '\n  %s%s %s %s%s\n' "$UI_CYAN" "$UI_CARD_TOP" "$title" "${line// /$UI_RULE_FILL}" "$UI_RESET"
+    local title=$1
+    UI_CARD_INNER=$(( $(ui_width) - 6 ))
+    if (( UI_CARD_INNER < 54 )); then
+        UI_CARD=0
+        printf '\n  %s%s%s\n' "$UI_BOLD" "$title" "$UI_RESET"
+        return 0
+    fi
     UI_CARD=1
+    printf '\n  %s%s %s %s%s%s\n' "$UI_CYAN" "$UI_CARD_TOP" "$title" \
+        "$(ui_fill $(( $(ui_width) - 7 - $(ui_dw "$title") )))" "$UI_ENDCAP_TOP" "$UI_RESET"
 }
 ui_card_end() {
-    local line
-    printf -v line '%*s' "$(( $(ui_width) - 4 ))" ''
-    printf '  %s%s%s%s\n' "$UI_CYAN" "$UI_CARD_BOTTOM" "${line// /$UI_RULE_FILL}" "$UI_RESET"
+    (( UI_CARD )) || { UI_CARD=0; return 0; }
+    printf '  %s%s%s%s%s\n' "$UI_CYAN" "$UI_CARD_BOTTOM" \
+        "$(ui_fill $(( $(ui_width) - 5 )))" "$UI_ENDCAP_BOTTOM" "$UI_RESET"
     UI_CARD=0
 }
-ui_note() {
-    local indent='  '
-    (( UI_CARD )) && indent="  $UI_CARD_SIDE "
-    printf '%s%s%s %s%s\n' "$indent" "$UI_CYAN" "$UI_ICON_NOTE" "$1" "$UI_RESET"
+# One padded line inside the open card.
+ui_cell() {
+    local text=$1 pad
+    pad=$(( UI_CARD_INNER - $(ui_dw "$text") ))
+    (( pad >= 0 )) || pad=0
+    printf '  %s%s%s %s%*s %s%s%s\n' "$UI_CYAN" "$UI_CARD_SIDE" "$UI_RESET" "$text" \
+        "$pad" '' "$UI_CYAN" "$UI_CARD_SIDE" "$UI_RESET"
 }
-# <ok|no|warn> <text>
+ui_note() {
+    if (( UI_CARD )); then ui_cell "$UI_ICON_NOTE $1"; return 0; fi
+    printf '  %s%s %s%s\n' "$UI_CYAN" "$UI_ICON_NOTE" "$1" "$UI_RESET"
+}
+# <ok|no|warn|info> <text>
 ui_check() {
-    local state=$1 text=$2 mark=$UI_ICON_OK color=$UI_GREEN indent='  '
+    local state=$1 text=$2 mark=$UI_ICON_OK
     case $state in
-        no) mark=$UI_ICON_NO; color=$UI_RED ;;
-        warn) mark=$UI_ICON_WARN; color=$UI_YELLOW ;;
-        info) mark=$UI_ICON_INFO; color='' ;;
+        no) mark=$UI_ICON_NO ;;
+        warn) mark=$UI_ICON_WARN ;;
+        info) mark=$UI_ICON_INFO ;;
     esac
-    (( UI_CARD )) && indent="  $UI_CARD_SIDE "
-    printf '%s%s%s%s %s\n' "$indent" "$color" "$mark" "$UI_RESET" "$text"
+    if (( UI_CARD )); then ui_cell "$mark $text"; return 0; fi
+    printf '  %s %s\n' "$mark" "$text"
 }
 ui_plain_cc() {
     case ${1:-} in
@@ -641,12 +676,17 @@ ui_restart_expect() {
     fi
 }
 ui_field() {
-    local label=$1 value=$2 indent='  '
-    (( UI_CARD )) && indent="  $UI_CARD_SIDE "
+    local label=$1 value=$2
     # Stack long values on narrow terminals; avoid CJK column padding.
     if (( $(ui_width) < 50 && ${#value} > 22 )); then
-        printf '%s%s：\n%s  %s\n' "$indent" "$label" "$indent" "$value"
-    else printf '%s%s：%s\n' "$indent" "$label" "$value"; fi
+        if (( UI_CARD )); then
+            printf '  %s%s%s %s\n' "$UI_CYAN" "$UI_CARD_SIDE" "$UI_RESET" "$label："
+            printf '    %s\n' "$value"
+        else printf '  %s：\n    %s\n' "$label" "$value"; fi
+        return 0
+    fi
+    if (( UI_CARD )); then ui_cell "${label}：${value}"
+    else printf '  %s：%s\n' "$label" "$value"; fi
 }
 ui_banner() {
     local status=$1 title=$2 color=$UI_GREEN
@@ -662,12 +702,11 @@ ui_change() {
     elif [[ $phase == actual ]]; then mark=已修改; color=$UI_GREEN
     elif [[ $phase == observed ]]; then mark=检测到变化
     else mark=将修改; fi
-    local indent='  '
-    (( UI_CARD )) && indent="  $UI_CARD_SIDE "
-    printf '%s%s[%s]%s %s\n' "$indent" "$color" "$mark" "$UI_RESET" "$label"
-    local vline="${indent}  "
-    if [[ -n $before && $before == "$after" ]]; then printf '%s%s\n' "$vline" "$after"
-    else printf '%s%s → %s\n' "$vline" "${before:-无法读取}" "${after:-无法读取}"; fi
+    local pair
+    if [[ -n $before && $before == "$after" ]]; then pair=$after
+    else pair="${before:-无法读取} → ${after:-无法读取}"; fi
+    if (( UI_CARD )); then ui_cell "[$mark] ${label}：$pair"; return 0; fi
+    printf '  %s[%s]%s %s\n    %s\n' "$color" "$mark" "$UI_RESET" "$label" "$pair"
 }
 config_result() {
     local title=$1 before_cc=$2 before_qd=$3 target_cc=$4 target_qd=$5 mode=${6:-changed}
