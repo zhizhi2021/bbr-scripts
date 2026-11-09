@@ -3,7 +3,7 @@
 # Algorithm references: https://github.com/google/bbr
 # No remote shell execution or kernel removal. Kernel install can reboot.
 
-VERSION=1.2.1
+VERSION=1.2.2
 STATE_DIR=/var/lib/bbr-script
 CONFIG=/etc/sysctl.d/99-zz-bbr-script.conf
 LOG=$STATE_DIR/bbr-script.log
@@ -16,6 +16,7 @@ SUPPORTED=0
 TX_ACTIVE=0 TX_DIR=''
 AUTO=0 SUITE=0 QUEUE_EXPLICIT=0 STREAMS_EXPLICIT=0 ALGORITHM_EXPLICIT=0
 BEFORE='' AFTER='' DEVICE_JSON='' DEVICE_QUEUE=fq DEVICE_BUDGET=0 DEVICE_STREAMS=1
+BENCH_INTERRUPTED=0
 
 say() { printf '%s\n' "$*"; }
 warn() { printf '提示：%s\n' "$*" >&2; }
@@ -76,8 +77,12 @@ dependency_manager() {
         id=$value; break
     done < "$OS_RELEASE"
     case $id in
-        debian|ubuntu) has apt-get && printf 'apt\n' ;;
-        rocky|almalinux) has dnf && printf 'dnf\n' ;;
+        debian|ubuntu)
+            has apt-get && { printf 'apt\n'; return 0; }
+            fail "已识别 $id，但缺少 apt-get，无法自动安装依赖"; return 1 ;;
+        rocky|almalinux)
+            has dnf && { printf 'dnf\n'; return 0; }
+            fail "已识别 $id，但缺少 dnf，无法自动安装依赖"; return 1 ;;
         *) fail '无法自动安装：此发行版未配置支持的包管理器'; return 1 ;;
     esac
 }
@@ -116,8 +121,8 @@ ensure_dependencies() {
                 else package=iproute; fi ;;
             flock|unshare|setsid) package=util-linux ;;
             modprobe) package=kmod ;;
-            lsinitramfs) [[ $manager == apt ]] || return 1; package=initramfs-tools-core ;;
-            lsinitrd) [[ $manager == dnf ]] || return 1; package=dracut ;;
+            lsinitramfs) [[ $manager == apt ]] || { fail '缺少 lsinitramfs，且此包管理器不支持自动安装'; return 1; }; package=initramfs-tools-core ;;
+            lsinitrd) [[ $manager == dnf ]] || { fail '缺少 lsinitrd，且此包管理器不支持自动安装'; return 1; }; package=dracut ;;
             awk) package=gawk ;; cmp) package=diffutils ;;
             timeout|stat|mktemp|date|head|tail|sort|cat|cp|mv|chmod|sync|rm|mkdir|rmdir|uname|df|readlink) package=coreutils ;;
             *) fail "没有工具 $tool 的可信包映射"; return 1 ;;
@@ -386,9 +391,10 @@ load_device_resources() {
     DEVICE_QUEUE=${fields[0]} DEVICE_BUDGET=${fields[1]} DEVICE_STREAMS=${fields[2]}
 }
 apply_device_defaults() {
+    # The queue memory budget belongs to `queue --auto` only. `enable --auto`
+    # manages the default qdisc and must not be blocked by that budget.
     (( AUTO )) || return 0
     load_device_resources || return 1
-    (( DEVICE_BUDGET >= 1048576 )) || { fail '设备可用内存不足，自动应用已停止，保留原配置'; return 1; }
     (( QUEUE_EXPLICIT )) || QUEUE=$DEVICE_QUEUE
 }
 show_device_profile() {
@@ -438,6 +444,9 @@ show_change_plan() {
 show_queue_plan() {
     show_device_profile || return 1
     apply_device_defaults || return 1
+    if (( AUTO )); then
+        (( DEVICE_BUDGET >= 1048576 )) || { fail '设备可用内存不足，自动队列修改已停止；请释放资源后重试'; return 1; }
+    fi
     say "网卡变更：$IFACE → $QUEUE；不改变系统默认算法与默认队列。"
     if (( AUTO )); then say "设备队列预算：$DEVICE_BUDGET 字节；fq 仅按包数估算，fq_codel/cake 使用内存限制。"; fi
     say '只在本次运行中更换可完整恢复的简单根队列；现有过滤器、共享 block 或未知拓扑会阻止修改。'
@@ -771,7 +780,7 @@ ui_benchmark_custom() {
     if (( SUITE )); then say "将分别进行单连接和 $STREAMS 流测试；并发为 1 时不重复测试。"; fi
     # Testing sends traffic, so give menu users a final chance to return.
     ui_read '回车开始测试，或输入 q 返回' || return 0
-    case $UI_INPUT in q|Q) return 0 ;; '') ;; *) warn '未开始测试，请重新选择。'; return 0 ;; esac
+    case $UI_INPUT in q|Q) return 0 ;; '') ;; *) warn '已取消，未开始测试。'; return 0 ;; esac
     ui_run '性能测试' run_benchmark || :
 }
 ui_quick_enable() {
@@ -904,7 +913,10 @@ secure_path() {
 prepare_state() {
     secure_path "$STATE_DIR" || return 1
     [[ -d ${STATE_DIR%/*} ]] || { fail '状态目录父路径不存在'; return 1; }
-    [[ -d $STATE_DIR ]] || mkdir -m 700 -- "$STATE_DIR" || return 1
+    # A concurrent first run may create it between the test and mkdir; the
+    # operation lock, not this mkdir, is what serialises modifications.
+    [[ -d $STATE_DIR ]] || mkdir -m 700 -- "$STATE_DIR" 2>/dev/null || [[ -d $STATE_DIR ]] ||
+        { fail "无法创建状态目录：$STATE_DIR"; return 1; }
     secure_path "$STATE_DIR" || return 1
 }
 acquire_lock() {
@@ -1023,9 +1035,15 @@ atomic_copy() {
     local src=$1 dest=$2 temp
     secure_path "$dest" || return 1
     temp=$(mktemp "${dest}.tmp.XXXXXXXX") || return 1
-    if ! cat -- "$src" > "$temp" || ! chmod 600 -- "$temp" || ! sync -f "$temp" || ! mv -fT -- "$temp" "$dest"; then
+    # The rename must be durable too: the destination may live on another
+    # filesystem than the staged file (e.g. /etc and /var/lib).
+    if ! cat -- "$src" > "$temp" || ! chmod 600 -- "$temp" || ! sync -f "$temp" ||
+        ! mv -fT -- "$temp" "$dest"; then
         rm -f -- "$temp"; return 1
     fi
+    # Best effort: the rename already succeeded and some filesystems reject
+    # syncfs, so a failure here must not turn a written file into an error.
+    sync -f -- "${dest%/*}" 2>/dev/null || warn "配置已写入，但目录同步失败：${dest%/*}"
 }
 valid_snapshot() {
     local dir=$1 cc qd
@@ -1090,6 +1108,7 @@ begin_transaction() {
     trap 'exit 130' INT
     trap 'exit 143' TERM
     trap 'exit 129' HUP
+    trap 'exit 131' QUIT
     sync -f "$STATE_DIR" || return 1
 }
 write_managed_config() {
@@ -1112,17 +1131,19 @@ archive_transaction() {
     sync -f "$STATE_DIR" || warn '归档已完成，但文件系统同步失败，请核对磁盘状态。'
 }
 rollback_transaction() {
-    [[ -d $TX_DIR && ! -L $TX_DIR ]] || return 1
-    local cc qd target_cc target_qd
-    cc=$(cat "$TX_DIR/snapshot/before.cc") || return 1
-    qd=$(cat "$TX_DIR/snapshot/before.qd") || return 1
-    target_cc=$(cat "$TX_DIR/target.cc") || return 1
-    target_qd=$(cat "$TX_DIR/target.qd") || return 1
-    valid_value "$cc" && valid_value "$qd" && valid_value "$target_cc" && valid_value "$target_qd" || return 1
+    [[ -d $TX_DIR && ! -L $TX_DIR ]] || { fail "事务记录不存在或不可用：$TX_DIR"; return 1; }
+    local cc qd target_cc target_qd value
+    cc=$(cat "$TX_DIR/snapshot/before.cc") || { fail '事务缺少原始算法记录，保留现场'; return 1; }
+    qd=$(cat "$TX_DIR/snapshot/before.qd") || { fail '事务缺少原始队列记录，保留现场'; return 1; }
+    target_cc=$(cat "$TX_DIR/target.cc") || { fail '事务缺少目标算法记录，保留现场'; return 1; }
+    target_qd=$(cat "$TX_DIR/target.qd") || { fail '事务缺少目标队列记录，保留现场'; return 1; }
+    for value in "$cc" "$qd" "$target_cc" "$target_qd"; do
+        valid_value "$value" || { fail '事务记录内容不合法，保留现场'; return 1; }
+    done
     read_pair || return 1
     [[ $PAIR_CC == "$cc" || $PAIR_CC == "$target_cc" ]] &&
         [[ $PAIR_QD == "$qd" || $PAIR_QD == "$target_qd" ]] || { fail '事务后运行参数有外部修改，拒绝覆盖。'; return 1; }
-    [[ ! -L $CONFIG ]] || return 1
+    [[ ! -L $CONFIG ]] || { fail '配置路径是符号链接，拒绝恢复'; return 1; }
     if [[ -e $CONFIG ]]; then
         cmp -s "$CONFIG" "$TX_DIR/after.conf" || cmp -s "$CONFIG" "$TX_DIR/snapshot/before.conf" || {
             fail '事务后配置有外部修改，拒绝覆盖。'; return 1;
@@ -1150,6 +1171,8 @@ rollback_transaction() {
 }
 transaction_exit() {
     local rc=$1
+    # A repeated Ctrl+C must not interrupt the rollback itself.
+    trap '' HUP INT QUIT TERM
     if (( TX_ACTIVE )); then
         warn '事务未完成，尝试恢复。'
         rollback_transaction || { warn "自动恢复未完成；保留 $TX_DIR，请检查后运行 restore。"; rc=1; }
@@ -1175,10 +1198,39 @@ finish_transaction() {
     fi
     sync -f "$STATE_DIR" || return 1
     archive_transaction || return 1
-    trap - EXIT INT TERM HUP
+    trap - EXIT INT QUIT TERM HUP
     log_event "$kind completed" || warn '操作成功，但日志记录失败。'
 }
-enable_bbr() ( enable_bbr_impl )
+# Run one privileged operation in a monitored subshell and forward termination
+# signals to it. A signal delivered to this process alone (timeout, pkill, a
+# supervisor) must not orphan the subshell and let it keep changing the system
+# after the caller was told the command had failed.
+forward_signal() {
+    local signal=$1 code=$2 child=$3
+    if [[ -n $child ]] && kill -0 -- "$child" 2>/dev/null; then
+        kill -s "$signal" -- "$child" 2>/dev/null || :
+        wait "$child" 2>/dev/null || :
+        exit "$code"
+    fi
+}
+run_isolated() {
+    local action=$1 child='' rc=0
+    # Install the forwarders before the fork so no signal can slip through the
+    # window between starting the child and being able to signal it.
+    trap 'forward_signal TERM 143 "$child"' TERM
+    # Forward as TERM: an asynchronous child may inherit SIGINT/SIGQUIT as
+    # ignored, and an ignored signal cannot be trapped again. TERM can always be
+    # trapped, and every operation uses the same rollback handler for all of them.
+    trap 'forward_signal TERM 130 "$child"' INT
+    trap 'forward_signal HUP 129 "$child"' HUP
+    trap 'forward_signal TERM 131 "$child"' QUIT
+    ( "$action" ) <&0 &
+    child=$!
+    wait "$child" || rc=$?
+    trap - HUP INT QUIT TERM
+    return "$rc"
+}
+enable_bbr() { run_isolated enable_bbr_impl; }
 enable_bbr_impl() {
     ensure_dependencies sysctl flock awk stat mktemp cp mv chmod sync rm mkdir rmdir grep cmp date uname cat || return $?
     if (( AUTO )); then ensure_dependencies python3 || return $?; fi
@@ -1216,7 +1268,7 @@ enable_bbr_impl() {
     finish_transaction enable || return 1
     config_result 'BBR 配置已启用' "$result_cc" "$result_qd" bbr "$QUEUE"
 }
-restore_state() ( restore_state_impl )
+restore_state() { run_isolated restore_state_impl; }
 restore_state_impl() {
     if (( DRY_RUN )); then say "预演：检查并恢复 $STATE_DIR 中的原配置与运行参数；不会删除其他配置。"; return 0; fi
     ensure_dependencies sysctl flock awk stat mktemp cp mv chmod sync rm mkdir rmdir grep cmp date uname cat || return $?
@@ -1225,7 +1277,10 @@ restore_state_impl() {
     secure_path "$CONFIG" && secure_path "$LOG" || return 1
     TX_DIR="$STATE_DIR/transaction"
     if [[ -d $TX_DIR ]]; then
-        rollback_transaction || return 1
+        rollback_transaction || {
+            fail "中断事务无法自动恢复；已原样保留 $TX_DIR。核对后如确认不再需要，可手工删除该目录再重试。"
+            return 1
+        }
         log_event 'recovered interrupted transaction' || return 1
         ui_banner '执行成功' '中断事务已恢复'
         ui_field '默认 TCP' "$(sys_value net.ipv4.tcp_congestion_control || printf '无法读取')"
@@ -1236,9 +1291,10 @@ restore_state_impl() {
     [[ -d $STATE_DIR/baseline ]] || { ui_banner '无需修改' '没有可恢复的原始状态'; return 0; }
     check_managed_file || return 1
     local cc qd applied_qd
-    cc=$(cat "$STATE_DIR/baseline/before.cc") || return 1
-    qd=$(cat "$STATE_DIR/baseline/before.qd") || return 1
-    valid_value "$cc" && valid_value "$qd" || return 1
+    cc=$(cat "$STATE_DIR/baseline/before.cc") || { fail "原始备份缺少算法记录：$STATE_DIR/baseline"; return 1; }
+    qd=$(cat "$STATE_DIR/baseline/before.qd") || { fail "原始备份缺少队列记录：$STATE_DIR/baseline"; return 1; }
+    { valid_value "$cc" && valid_value "$qd"; } ||
+        { fail '原始备份内容不合法；请核对历史恢复记录后手工处理'; return 1; }
     detect_conflicts "$cc" "$qd" || return 1
     read_pair || return 1
     local result_cc=$PAIR_CC result_qd=$PAIR_QD
@@ -1316,8 +1372,11 @@ try:
     q=json.load(sys.stdin)
     if not isinstance(q,list) or len(q)!=1 or not isinstance(q[0],dict):raise ValueError('队列结构不合法')
     if set(q[0])-{'kind','handle','root','refcnt','options'}:raise ValueError('存在共享 block、卸载或未知拓扑属性，不能可靠恢复')
-    if not q[0].get('root') or q[0].get('kind')!='fq_codel':
-        raise ValueError('仅可恢复单个 fq_codel 根队列；其他拓扑只诊断')
+    if not q[0].get('root'):
+        raise ValueError('根队列不是 root，拒绝修改')
+    if q[0].get('kind')!='fq_codel':
+        raise ValueError('当前根队列为 %s：自动更换与可验证回滚只在原始为单个 fq_codel 时可用；'
+                         '本脚本不会自动替换该拓扑；请先手工记录 tc qdisc show dev <网卡>' % q[0].get('kind'))
     options=q[0].get('options',{})
     supported={'limit','flows','quantum','target','interval','memory_limit','ecn','drop_batch','ce_threshold'}
     required={'limit','flows','quantum','target','interval','memory_limit'}
@@ -1382,10 +1441,30 @@ try:
 except (ValueError,OSError,TypeError,KeyError):sys.exit(1)
 PY
 }
+archive_queue_snapshot() {
+    local dir=$1 history
+    history=$(mktemp -d "$STATE_DIR/queue-restored.XXXXXXXX") || return 1
+    mv -- "$dir" "$history/snapshot" || return 1
+    sync -f "$STATE_DIR" || warn '队列快照已归档，但文件系统同步失败，请核对磁盘状态。'
+}
 rollback_queue() {
     local dir=$1 iface
-    iface=$(cat "$dir/interface") || return 1
-    [[ $iface =~ ^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,14}$ ]] || return 1
+    iface=$(cat "$dir/interface") || { fail '队列快照缺少网卡记录，保留现场'; return 1; }
+    [[ $iface =~ ^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,14}$ ]] || { fail "队列快照网卡名不合法：$iface"; return 1; }
+    # A queue change lives in memory only. Once the device is gone or the
+    # machine has rebooted, the old snapshot can never be re-applied and must
+    # not block every later queue operation.
+    if [[ ! -e /sys/class/net/$iface ]] && { ! has ip || ! ip link show dev "$iface" >/dev/null 2>&1; }; then
+        archive_queue_snapshot "$dir" || return 1
+        say "网卡 $iface 已不存在，此前的队列修改随之失效；已归档旧快照。"
+        return 0
+    fi
+    if [[ -s $dir/boot_id && -r /proc/sys/kernel/random/boot_id ]] &&
+        [[ $(cat "$dir/boot_id") != "$(< /proc/sys/kernel/random/boot_id)" ]]; then
+        archive_queue_snapshot "$dir" || return 1
+        say '系统已重启，此前的队列修改仅在当时的运行中生效；已归档旧快照（当前队列保持现状）。'
+        return 0
+    fi
     if queue_matches "$iface" "$dir/before.json"; then :
     elif [[ -f $dir/after.json ]] && queue_matches "$iface" "$dir/after.json"; then
         ensure_no_queue_filters "$iface" || return 1
@@ -1394,15 +1473,17 @@ rollback_queue() {
         tc qdisc replace dev "$iface" root "${args[@]}" || return 1
         queue_matches "$iface" "$dir/before.json" || { fail '队列恢复后校验失败'; return 1; }
     else
-        fail "队列与已知快照不一致，拒绝覆盖；原始参数在 $dir/before.args"; return 1
+        fail "队列与已知快照不一致，拒绝覆盖；原始参数在 $dir/before.args"
+        fail "确认无需恢复该队列后，可手工删除 $dir 再重试。"
+        return 1
     fi
-    local history
-    history=$(mktemp -d "$STATE_DIR/queue-restored.XXXXXXXX") || return 1
-    mv -- "$dir" "$history/snapshot" || return 1
+    archive_queue_snapshot "$dir" || return 1
     say "已恢复 $iface 原队列；仅本次运行生效，未修改启动服务。"
 }
 queue_exit() {
     local rc=$1
+    # A repeated Ctrl+C must not interrupt the rollback itself.
+    trap '' HUP INT QUIT TERM
     if (( QUEUE_ACTIVE )); then
         warn '队列操作中断，尝试恢复。'
         rollback_queue "$STATE_DIR/queue.pending" || warn "未能自动恢复，请检查 $STATE_DIR/queue.pending 后运行 queue-restore。"
@@ -1477,7 +1558,7 @@ prepare_queue_target() {
     sync -f "$dest"
 }
 
-set_queue() ( set_queue_impl )
+set_queue() { run_isolated set_queue_impl; }
 set_queue_impl() {
     ensure_dependencies python3 ip tc unshare flock || return $?
     [[ -n $IFACE ]] || { fail '请指定 --interface 网卡'; return 2; }
@@ -1501,18 +1582,25 @@ set_queue_impl() {
         rm -rf -- "$temp"; return 1
     fi
     ensure_no_queue_filters || { rm -rf -- "$temp"; return 1; }
-    printf '%s\n' "$IFACE" > "$temp/interface" || return 1
+    printf '%s\n' "$IFACE" > "$temp/interface" || { rm -rf -- "$temp"; return 1; }
+    if [[ -r /proc/sys/kernel/random/boot_id ]]; then
+        cat /proc/sys/kernel/random/boot_id > "$temp/boot_id" || { rm -rf -- "$temp"; return 1; }
+    fi
     ensure_queue_module || { rm -rf -- "$temp"; return 1; }
     prepare_queue_target "$temp/after.json" || { rm -rf -- "$temp"; return 1; }
-    sync -f "$temp" || return 1
-    if ! queue_matches "$IFACE" "$temp/before.json" || ! ensure_no_queue_filters; then fail '预检期间队列或过滤器发生变化，停止修改'; return 1; fi
-    log_event "queue begin interface=$IFACE qdisc=$QUEUE" || return 1
-    mv -T -- "$temp" "$STATE_DIR/queue.pending" || return 1
+    sync -f "$temp" || { rm -rf -- "$temp"; return 1; }
+    if ! queue_matches "$IFACE" "$temp/before.json" || ! ensure_no_queue_filters; then
+        fail '预检期间队列或过滤器发生变化，停止修改'
+        rm -rf -- "$temp"; return 1
+    fi
+    log_event "queue begin interface=$IFACE qdisc=$QUEUE" || { rm -rf -- "$temp"; return 1; }
+    mv -T -- "$temp" "$STATE_DIR/queue.pending" || { rm -rf -- "$temp"; return 1; }
     QUEUE_ACTIVE=1
     trap 'queue_exit $?' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
     trap 'exit 129' HUP
+    trap 'exit 131' QUIT
     sync -f "$STATE_DIR" || return 1
     local -a target_args
     mapfile -t target_args < "$STATE_DIR/queue.pending/target.args" || return 1
@@ -1534,7 +1622,7 @@ set_queue_impl() {
     say '  生效范围：本次运行；重启后不自动重建。'
     ui_field '恢复命令' 'bash bbr.sh queue-restore'
 }
-restore_queue() ( restore_queue_impl )
+restore_queue() { run_isolated restore_queue_impl; }
 restore_queue_impl() {
     if (( DRY_RUN )); then say '预演：核对当前队列与快照，恢复此前简单根队列；不改变启动配置。'; return 0; fi
     detect_system; require_mutation recovery || return 1
@@ -1566,21 +1654,32 @@ key={'debian':'debian-archive-keyring.gpg','ubuntu':'ubuntu-archive-keyring.gpg'
 key='/usr/share/keyrings/'+key
 allowed={'debian':{'deb.debian.org','security.debian.org'},
          'ubuntu':{'archive.ubuntu.com','security.ubuntu.com','ports.ubuntu.com'}}[distro]
-lines=[]
+lines=[];skipped=[]
+core=set()
+if codename:core={codename,codename+'-updates',codename+'-security'}
+def skip(uri,suite,reason):
+    skipped.append('%s %s：%s'%(uri,suite,reason))
+    return False
 def emit(uri,suite,components,opts=''):
     u=urllib.parse.urlsplit(uri)
     official=u.hostname in allowed or (distro=='ubuntu' and (u.hostname or '').endswith('.archive.ubuntu.com'))
-    if (u.scheme not in ('http','https') or not official or u.username or u.password
-        or u.port or u.query or u.fragment): raise ValueError('只允许明确的发行版官方仓库主机')
+    # Only the release, -updates and -security suites of the distribution's own
+    # archive are used. Extra suites (backports, proposed) and third-party
+    # mirrors are skipped instead of aborting the installation: the kernel never
+    # comes from them, and one unrelated source must not block a supported host.
+    if not core: raise ValueError('无法确定发行版代号，拒绝猜测仓库')
+    if not official: return skip(uri,suite,'非发行版官方主机')
+    if suite not in core: return skip(uri,suite,'非正式/更新/安全套件')
+    if (u.scheme not in ('http','https') or u.username or u.password
+        or u.port or u.query or u.fragment): raise ValueError('发行版官方仓库地址不合法')
     if not re.fullmatch(r'/[A-Za-z0-9_./-]*',u.path): raise ValueError('仓库路径不合法')
-    if not codename or suite not in (codename,codename+'-updates',codename+'-security'):
-        raise ValueError('只接受当前代号的正式版、updates 和 security 仓库')
     if not components or any(not re.fullmatch(r'[a-z0-9-]+',x) for x in components):
         raise ValueError('仓库组件不合法')
     low=opts.lower()
     if re.search(r'(trusted\s*[=:]\s*yes|allow-insecure\s*[=:]\s*(yes|true)|check-valid-until\s*[=:]\s*no)',low):
         raise ValueError('拒绝关闭验证的仓库选项')
     lines.append('deb [signed-by='+key+'] '+uri+' '+suite+' '+' '.join(components))
+    return True
 try:
     files=[root/'sources.list']+sorted((root/'sources.list.d').glob('*.list'))+sorted((root/'sources.list.d').glob('*.sources'))
     for p in files:
@@ -1603,11 +1702,15 @@ try:
         else:
             for line in text.splitlines():
                 line=line.split('#',1)[0].strip()
-                if not line or line.startswith('deb-src '):continue
+                if not line:continue
+                if line.split()[0]=='deb-src':continue
                 m=re.fullmatch(r'deb\s+(?:\[([^\]]*)\]\s+)?(\S+)\s+(\S+)\s+(.+)',line)
                 if not m: raise ValueError('无法解析 sources.list')
                 opts,uri,suite,components=m.groups();emit(uri,suite,components.split(),opts or '')
-    if not lines:raise ValueError('没有可使用的官方二进制仓库')
+    if skipped:
+        print('以下仓库不参与本次内核安装：',file=sys.stderr)
+        for item in skipped:print('  已跳过 '+item,file=sys.stderr)
+    if not lines:raise ValueError('没有可使用的发行版官方核心仓库（需要 %s 或其 -updates / -security）'%codename)
     print('\n'.join(dict.fromkeys(lines)))
 except (ValueError,OSError) as e:
     print('APT 来源检查失败：'+str(e),file=sys.stderr);sys.exit(1)
@@ -1704,8 +1807,27 @@ read_boot_default() {
         *) return 1 ;;
     esac
 }
+# grub-set-default and grubby only write their metadata; neither checks that the
+# recorded entry still exists. Restoring a stale entry would look successful and
+# silently fall back to the menu default at the next boot.
+boot_entry_available() {
+    case $BOOT_MODE in
+        grub)
+            [[ -r /boot/grub/grub.cfg ]] || return 1
+            grep -Fq -- "${BOOT_ENTRY##*>}" /boot/grub/grub.cfg ;;
+        grubby)
+            [[ -f $BOOT_ENTRY ]] && grubby --info="$BOOT_ENTRY" >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
 verify_kernel_switch() {
     local dir="$STATE_DIR/kernel.pending" target entry mode observed history
+    # A journal without target records means the install died while packages
+    # were still being changed; reporting success here would be a lie.
+    if [[ -d $dir && ! -f $dir/target-version ]]; then
+        fail '存在未完成的内核事务且缺少目标内核记录；请先运行 kernel recover 恢复原默认启动项。'
+        return 1
+    fi
     [[ -f $dir/target-version ]] || dir="$STATE_DIR/kernel-switched"
     [[ -f $dir/target-version ]] || return 0
     target=$(cat "$dir/target-version") && entry=$(cat "$dir/target-entry") && mode=$(cat "$dir/mode") || return 1
@@ -1784,7 +1906,7 @@ stop_kernel_child() {
 }
 kernel_signal() {
     local rc=$1
-    trap '' HUP INT TERM
+    trap '' HUP INT QUIT TERM
     stop_kernel_child
     exit "$rc"
 }
@@ -1802,6 +1924,7 @@ begin_kernel_journal() {
     trap 'kernel_signal 130' INT
     trap 'kernel_signal 143' TERM
     trap 'kernel_signal 129' HUP
+    trap 'kernel_signal 131' QUIT
     sync -f "$STATE_DIR" || return 1
 }
 recover_kernel_journal() {
@@ -1811,6 +1934,12 @@ recover_kernel_journal() {
     BOOT_ENTRY=$(cat "$dir/entry") || return 1
     case $BOOT_MODE in grub|grubby) ;; *) fail '未知的启动恢复模式'; return 1 ;; esac
     [[ -n $BOOT_ENTRY && $BOOT_ENTRY != -* && $BOOT_ENTRY != *$'\n'* && $BOOT_ENTRY != *$'\r'* ]] || { fail '启动项记录不合法'; return 1; }
+    boot_entry_available || {
+        fail "原默认启动项已不在启动配置中：$BOOT_ENTRY"
+        fail '保留恢复记录；请通过控制台核对该内核是否仍安装后再手工处理。'
+        fail "确认该内核已卸载、无需回退后，可手工删除 $dir 再重试。"
+        return 1
+    }
     preserve_boot || { fail '启动项恢复失败，请通过控制台检查；保留恢复记录'; return 1; }
     history=$(mktemp -d "$STATE_DIR/kernel-history.XXXXXXXX") || return 1
     mv -- "$dir" "$history/journal" || return 1
@@ -1820,15 +1949,16 @@ recover_kernel_journal() {
 }
 kernel_exit() {
     local rc=$1
-    trap '' HUP INT TERM
+    trap '' HUP INT QUIT TERM
     stop_kernel_child
     if (( KERNEL_ACTIVE )); then
         warn '内核操作退出，恢复原默认启动项。'
-        recover_kernel_journal || { warn '请通过控制台核对后执行 kernel recover；勿直接重启。'; rc=1; }
+        recover_kernel_journal || { warn '默认启动项可能仍指向新内核；请通过控制台核对后执行 kernel recover，勿直接重启。'; rc=1; }
     fi
     trap - EXIT; exit "$rc"
 }
-kernel_recover() (
+kernel_recover() { run_isolated kernel_recover_impl; }
+kernel_recover_impl() {
     if (( DRY_RUN )); then say '预演：从内核事务或已确认切换记录恢复原默认启动项，不卸载软件包。'; return 0; fi
     ensure_dependencies sysctl flock awk stat mktemp cp mv chmod sync rm mkdir rmdir grep cmp date uname cat || return $?
     detect_system; require_mutation recovery || return 1
@@ -1837,7 +1967,7 @@ kernel_recover() (
         mv -- "$STATE_DIR/kernel-switched" "$STATE_DIR/kernel.pending" || return 1
     fi
     recover_kernel_journal
-)
+}
 vendor_key_owned() {
     local owner
     owner=$(rpm -qf --qf '%{NAME}' -- "$1") || return 1
@@ -2063,6 +2193,21 @@ resolve_kernel_boot_entry() {
         TARGET_ENTRY=$TARGET_IMAGE
     else fail '不支持的启动器'; return 1; fi
 }
+# Debian and Ubuntu encode the kernel flavour after the numeric ABI, e.g.
+# 6.1.0-13-rt-amd64 or 6.8.0-31-generic. Refuse an automatic switch that would
+# silently replace a vendor/RT kernel with a different flavour; names this
+# cannot parse are left to the existing package verification instead of guessed.
+kernel_flavour_matches() {
+    local running=$1 target=$2 running_flavour='' target_flavour=''
+    # The flavour suffix is Debian/Ubuntu packaging metadata; RPM releases use a
+    # different scheme and are not constrained here.
+    [[ $OS_ID == debian || $OS_ID == ubuntu ]] || return 0
+    [[ $running =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-(.*)$ ]] && running_flavour=${BASH_REMATCH[1]}
+    [[ $target =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-(.*)$ ]] && target_flavour=${BASH_REMATCH[1]}
+    [[ -z $running_flavour || -z $target_flavour ]] && return 0
+    [[ $running_flavour == "$target_flavour" ]]
+}
+
 request_kernel_reboot() {
     if has systemctl && [[ $(cat /proc/1/comm) == systemd ]]; then systemctl reboot
     elif has reboot; then reboot
@@ -2078,6 +2223,11 @@ complete_kernel_switch() {
         return 0
     fi
     (( rc == 0 )) || return "$rc"
+    kernel_flavour_matches "$(uname -r)" "$TARGET_VERSION" || {
+        fail "目标内核 $TARGET_VERSION 与运行内核 $(uname -r) 的 flavour 不同"
+        fail '自动替换会改变内核形态（如 RT/cloud/aws），已取消切换与重启；请手工安装所需内核。'
+        return 1
+    }
     validate_kernel_target && resolve_kernel_boot_entry || return 1
     printf '%s\n' "$TARGET_VERSION" > "$STATE_DIR/kernel.pending/target-version" || return 1
     printf '%s\n' "$TARGET_ENTRY" > "$STATE_DIR/kernel.pending/target-entry" || return 1
@@ -2096,14 +2246,14 @@ complete_kernel_switch() {
     sleep 10 || return 1
     # SSH may disconnect as soon as reboot is accepted. Do not roll back a
     # verified default merely because that disconnect sends SIGHUP.
-    trap '' HUP INT TERM
+    trap '' HUP INT QUIT TERM
     request_kernel_reboot || { rc=$?; fail '自动重启失败，将恢复原默认启动项'; return "$rc"; }
     KERNEL_ACTIVE=0
     trap - EXIT
     say '  [已请求重启] 重连后运行 kernel verify 核验。'
 }
 
-kernel_install() ( kernel_install_impl )
+kernel_install() { run_isolated kernel_install_impl; }
 kernel_install_impl() {
     say '内核安装成功并切换默认启动项后，将自动重启。'
     detect_system; require_mutation || return 1
@@ -2114,23 +2264,27 @@ kernel_install_impl() {
     [[ ! -e $STATE_DIR/kernel.pending ]] || { fail '存在待确认的内核事务，请先 kernel verify 或 kernel recover'; return 1; }
     boot_preflight || return 1
     [[ -d /boot && -d /lib/modules ]] || { fail '缺少 /boot 或 /lib/modules'; return 1; }
-    local free_boot free_modules package rc=0
+    local free_boot free_modules package rc=0 sources='' keyring
     free_boot=$(df -Pk /boot | awk 'END {print $4}') || return 1
     free_modules=$(df -Pk /lib/modules | awk 'END {print $4}') || return 1
     if [[ ! $free_boot =~ ^[0-9]+$ || ! $free_modules =~ ^[0-9]+$ ]] ||
         (( free_boot < 716800 || free_modules < 2097152 )); then fail '启动分区或模块目录空间不足'; return 1; fi
     package=$(kernel_package) || return 1
+    if [[ $OS_ID == debian || $OS_ID == ubuntu ]]; then
+        # Validate the sources before a journal or boot change exists, so a
+        # refused source list leaves nothing to roll back.
+        [[ $OS_ID == debian ]] && keyring=/usr/share/keyrings/debian-archive-keyring.gpg || keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg
+        [[ -s $keyring ]] || { fail '缺少发行版归档签名 keyring'; return 1; }
+        OS_CODENAME=$(read_os_field VERSION_CODENAME)
+        sources=$(apt_sources /etc/apt) || return 1
+    fi
     begin_kernel_journal || return 1
     uname -r > "$STATE_DIR/kernel-before" || return 1
     printf '%s\n' "$BOOT_ENTRY" > "$STATE_DIR/kernel-boot-entry" || return 1
     log_event "kernel install begin distro=$OS_ID package=$package" || return 1
     if [[ $OS_ID == debian || $OS_ID == ubuntu ]]; then
-        local keyring sources pin_text
+        local pin_text
         local -a pins=()
-        [[ $OS_ID == debian ]] && keyring=/usr/share/keyrings/debian-archive-keyring.gpg || keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg
-        [[ -s $keyring ]] || { fail '缺少发行版归档签名 keyring'; return 1; }
-        OS_CODENAME=$(read_os_field VERSION_CODENAME)
-        sources=$(apt_sources /etc/apt) || return 1
         printf '%s\n' "$sources" > "$STATE_DIR/kernel-sources.list" || return 1
         [[ -d $STATE_DIR/empty-sources ]] || mkdir -m 700 "$STATE_DIR/empty-sources" || return 1
         local -a opts=(-o "Dir::Etc::sourcelist=$STATE_DIR/kernel-sources.list" -o "Dir::Etc::sourceparts=$STATE_DIR/empty-sources"
@@ -2199,7 +2353,10 @@ try:
         if not isinstance(stream,dict): raise ValueError('流统计项不合法')
         sender=stream.get('sender',{})
         if not isinstance(sender,dict): raise ValueError('发送流统计不合法')
-        if 'mean_rtt' in sender:rtts.append(number(sender['mean_rtt'],'RTT')/1000)
+        if 'mean_rtt' in sender:
+            rtt=number(sender['mean_rtt'],'RTT')
+            # Reverse mode reports 0 when the sender sampled no RTT at all.
+            if rtt>0:rtts.append(rtt/1000)
     cc=end.get('sender_tcp_congestion')
     if cc is None:cc='未知（服务端/旧版 iperf3 未报告）'
     elif not isinstance(cc,str) or not re.fullmatch(r'[A-Za-z0-9_]{1,32}',cc):raise ValueError('算法报告不合法')
@@ -2240,21 +2397,34 @@ run_benchmark_once() {
     say "目标 $HOST:$PORT；每轮 ${DURATION}s；并发 $STREAMS；reverse=$REVERSE"
     say '只设置测试 socket，不修改系统默认拥塞算法。'
     if (( REVERSE )); then warn '反向模式算法由服务端决定，--algorithm 不作为服务端算法证明。'; fi
+    # iperf3 handles SIGINT itself and exits non-zero, so without a flag the next
+    # algorithm (or the next suite round) would still run. SIGTERM keeps its
+    # conventional immediate-stop behaviour.
+    BENCH_INTERRUPTED=0
+    trap 'BENCH_INTERRUPTED=1' INT
     for algorithm in "${algorithms[@]}"; do
+        (( BENCH_INTERRUPTED == 0 )) || break
         local -a args=(-c "$HOST" -p "$PORT" -t "$DURATION" -P "$STREAMS" -J --connect-timeout 5000)
         if (( REVERSE )); then args+=(-R); else args+=(-C "$algorithm"); fi
         result="$dir/$algorithm.json"
         say "测试请求算法：$algorithm"
         current_rc=0
         # A bounded wall-clock timeout also covers a peer stalling after connect.
-        if has timeout; then timeout --signal=TERM --kill-after=5 "$(( DURATION + 30 ))" iperf3 "${args[@]}" > "$result" 2>"$dir/$algorithm.stderr" || current_rc=$?
+        # --foreground keeps iperf3 in this process group so an interactive
+        # Ctrl+C reaches it instead of leaving the test running to completion.
+        if has timeout; then timeout --foreground --signal=TERM --kill-after=5 "$(( DURATION + 30 ))" iperf3 "${args[@]}" > "$result" 2>"$dir/$algorithm.stderr" || current_rc=$?
         else fail '需要 coreutils timeout 以限制远端测试等待'; return 1; fi
+        (( ! BENCH_INTERRUPTED )) || break
         if (( current_rc != 0 )); then
             warn "iperf3 失败，退出码 $current_rc；详情：$dir/$algorithm.stderr"
             (( rc != 0 )) || rc=$current_rc
         fi
         benchmark_summary < "$result" || { (( rc != 0 )) || rc=1; }
     done
+    trap - INT
+    if (( BENCH_INTERRUPTED )); then
+        return 130
+    fi
     if (( COMPARE )); then
         say '对比按 cubic → bbr 顺序进行，仅代表这两次测量；路径变化和测试顺序会影响结果。'
     fi
@@ -2262,20 +2432,32 @@ run_benchmark_once() {
 }
 
 run_benchmark() {
-    (( SUITE )) || { run_benchmark_once; return $?; }
+    if (( ! SUITE )); then
+        run_benchmark_once; local rc=$?
+        (( rc != 130 )) || warn '测试已中断。'
+        return "$rc"
+    fi
     [[ -n $HOST ]] || { fail '请指定 --host'; return 2; }
     (( REVERSE == 0 || COMPARE == 0 )) || { fail '反向模式不能使用 --compare'; return 2; }
     ensure_dependencies python3 || return $?
     load_device_resources || return 1
-    local pressure=$DEVICE_STREAMS rc=0 current=0
+    local pressure=$DEVICE_STREAMS rc=0 current=0 interrupted=0
     (( ! STREAMS_EXPLICIT )) || pressure=$STREAMS
     say '设备测试套件：先单连接，再单独测试并发；每轮使用相同目标、时长和方向。'
+    trap 'interrupted=1' INT
     ( STREAMS=1; run_benchmark_once ) || rc=$?
-    if (( pressure > 1 )); then
+    if (( ! interrupted )) && (( pressure > 1 )); then
         say "并发测试：$pressure 流（手动 --parallel 优先）"
         ( STREAMS=$pressure; run_benchmark_once ) || current=$?
         (( rc != 0 )) || rc=$current
-    else say '本次并发设置为 1，未重复执行相同条件的测试。'; fi
+    elif (( ! interrupted )); then
+        say '本次并发设置为 1，未重复执行相同条件的测试。'
+    fi
+    trap - INT
+    if (( interrupted )); then
+        warn '测试已中断，未继续后续轮次。'
+        return 130
+    fi
     return "$rc"
 }
 benchmark_compare() {
@@ -2292,8 +2474,15 @@ def conditions(path):
         d[k]=v
     return d
 
-def metric(path,algo):
-    raw=json.loads((path/(algo+'.json')).read_text())
+def metric(path,algo,allow_fallback=False):
+    target=path/(algo+'.json')
+    if allow_fallback and not target.is_file():
+        # --reverse sends no -C, so the recorded --algorithm can name a file the
+        # other run never created; fall back to that directory's single result.
+        candidates=[p for p in path.glob('*.json') if p.is_file()]
+        if len(candidates)!=1:raise ValueError('缺少结果文件：'+algo+'.json')
+        target=candidates[0]
+    raw=json.loads(target.read_text())
     if not isinstance(raw,dict) or raw.get('error'):raise ValueError('结果包含失败或不是有效对象')
     end=raw['end'];rate=end['sum_received']['bits_per_second']
     if type(rate) not in (int,float) or not math.isfinite(rate) or rate<0:raise ValueError('吞吐无效')
@@ -2304,24 +2493,34 @@ def metric(path,algo):
         val=stream.get('sender',{}).get('mean_rtt')
         if val is not None:
             if type(val) not in (int,float) or not math.isfinite(val) or val<0:raise ValueError('RTT 无效')
-            rtts.append(val/1000)
+            if val>0:rtts.append(val/1000)
     cc=end.get('sender_tcp_congestion')
     if cc is not None and (not isinstance(cc,str) or not re.fullmatch(r'[A-Za-z0-9_]{1,32}',cc)):raise ValueError('实测算法报告无效')
     return rate,retries,(sum(rtts)/len(rtts) if rtts else None),cc
 try:
     before,after=map(pathlib.Path,sys.argv[1:]);a=conditions(before);b=conditions(after)
-    for key in ('host','port','duration','parallel','reverse','requested_algorithm','compare'):
+    for key in ('host','port','duration','parallel','reverse','compare'):
         if key not in a or key not in b or a[key]!=b[key]:raise ValueError('条件不一致或缺失：'+key)
+    # --algorithm only selects the tested socket's algorithm: --reverse leaves
+    # it to the server and --compare always runs cubic+bbr, so it must not reject
+    # two physically identical runs whose flag merely differed.
+    if a['reverse']=='0' and a['compare']=='0':
+        if ('requested_algorithm' not in a or 'requested_algorithm' not in b
+            or a['requested_algorithm']!=b['requested_algorithm']):
+            raise ValueError('条件不一致或缺失：requested_algorithm')
+    if 'requested_algorithm' not in a or 'requested_algorithm' not in b:
+        raise ValueError('条件缺失：requested_algorithm')
     algo=a['requested_algorithm']
     if not re.fullmatch(r'[A-Za-z0-9_]{1,32}',algo):raise ValueError('算法名称不合法')
     algorithms=['cubic','bbr'] if a['compare']=='1' else [algo]
+    fallback=a['reverse']=='1'
     if a['compare'] not in ('0','1'):raise ValueError('compare 条件不合法')
     for algo in algorithms:
-        x=metric(before,algo);y=metric(after,algo)
+        x=metric(before,algo,fallback);y=metric(after,algo,fallback)
         if x[3] and y[3] and x[3]!=y[3]:raise ValueError('实测发送端算法不一致，不能按相同条件比较')
         if a['reverse']=='1' and (not x[3] or not y[3]):raise ValueError('反向测试缺少服务端实测算法，不能确认可比性')
         delta='%+.1f%%'%((y[0]/x[0]-1)*100) if x[0] else '不可计算（原吞吐为 0）'
-        fmt=lambda v:'未知' if v is None else ('%.3f'%v)
+        fmt=lambda v:'未知' if v is None else (('%d'%v) if type(v) is int else ('%.3f'%v))
         print('%s：吞吐 %.3f → %.3f Mbps（%s）'%(algo,x[0]/1e6,y[0]/1e6,delta))
         print('  实测发送端算法 %s → %s'%(x[3] or '未知',y[3] or '未知'))
         print('  重传 %s → %s；各流平均 RTT 的均值 %s → %s ms'%(fmt(x[1]),fmt(y[1]),fmt(x[2]),fmt(y[2])))
