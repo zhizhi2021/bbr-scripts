@@ -21,7 +21,8 @@ BENCH_INTERRUPTED=0
 # Piped or dumb output keeps the plain ASCII forms.
 UI_CARD=0 QUICK_CPUS='' QUICK_MEM_KB=''
 UI_BAR_ON='#' UI_BAR_OFF='-' UI_ICON_OK='[OK]' UI_ICON_NO='[NG]' UI_ICON_WARN='[!]'
-UI_ICON_NOTE='>' UI_ICON_INFO='-' UI_SEP='|' UI_CARD_TOP='+-' UI_CARD_SIDE='|' UI_CARD_BOTTOM='+-'
+UI_ICON_NOTE='>' UI_ICON_INFO='-' UI_SEP='|' UI_RULE_FILL='-'
+UI_CARD_TOP='+-' UI_CARD_SIDE='|' UI_CARD_BOTTOM='+-'
 
 say() { printf '%s\n' "$*"; }
 warn() { printf '提示：%s\n' "$*" >&2; }
@@ -441,7 +442,8 @@ if sys.argv[1]=="full":
  qtail="%.2f MiB（上限 32 MiB）"%(qb/1048576.0) if cols>=50 else "%.2f MiB"%(qb/1048576.0)
  print("  队列预算：%s  %s"%(bar(qb,32*1024**2),qtail))
  print("")
- print("  说明（说人话）")
+ print("  说明（白话版）")
+ print("    CPU 有效/可见核数；内存 可用/上限。")
  print("    CPU 和内存只用来挑建议值。")
  print("    已考虑亲和性与 cgroup 配额。")
  print("    fq 的包数按 4 KiB/包估算。")
@@ -538,9 +540,10 @@ UI_INPUT=''
 ui_init() {
     UI_BOLD='' UI_CYAN='' UI_GREEN='' UI_YELLOW='' UI_RED='' UI_RESET=''
     UI_CARD=0
-    if [[ ${TERM:-dumb} != dumb ]]; then
+    if [[ -t 1 && ${TERM:-dumb} != dumb ]]; then
         UI_BAR_ON='█' UI_BAR_OFF='░' UI_ICON_OK='✓' UI_ICON_NO='✗'
-        UI_ICON_WARN='!' UI_ICON_NOTE='▸' UI_ICON_INFO='·' UI_SEP='·' UI_CARD_TOP='┌─' UI_CARD_SIDE='│' UI_CARD_BOTTOM='└─'
+        UI_ICON_WARN='!' UI_ICON_NOTE='▸' UI_ICON_INFO='·' UI_SEP='·' UI_RULE_FILL='─'
+        UI_CARD_TOP='┌─' UI_CARD_SIDE='│' UI_CARD_BOTTOM='└─'
     fi
     if [[ -t 1 && ${TERM:-dumb} != dumb && -z ${NO_COLOR+x} ]]; then
         UI_BOLD=$'\033[1m'; UI_CYAN=$'\033[36m'; UI_GREEN=$'\033[32m'
@@ -566,25 +569,30 @@ ui_card_begin() {
     local title=$1 dw=${2:-8} line
     printf -v line '%*s' "$(( $(ui_width) - 6 - dw ))" ''
     (( ${#line} >= 2 )) || line='  '
-    printf '\n  %s%s %s %s%s\n' "$UI_CYAN" "$UI_CARD_TOP" "$title" "${line// /-}" "$UI_RESET"
+    printf '\n  %s%s %s %s%s\n' "$UI_CYAN" "$UI_CARD_TOP" "$title" "${line// /$UI_RULE_FILL}" "$UI_RESET"
     UI_CARD=1
 }
 ui_card_end() {
     local line
     printf -v line '%*s' "$(( $(ui_width) - 4 ))" ''
-    printf '  %s%s%s%s\n' "$UI_CYAN" "$UI_CARD_BOTTOM" "${line// /-}" "$UI_RESET"
+    printf '  %s%s%s%s\n' "$UI_CYAN" "$UI_CARD_BOTTOM" "${line// /$UI_RULE_FILL}" "$UI_RESET"
     UI_CARD=0
 }
-ui_note() { printf '  %s%s %s%s\n' "$UI_CYAN" "$UI_ICON_NOTE" "$1" "$UI_RESET"; }
+ui_note() {
+    local indent='  '
+    (( UI_CARD )) && indent="  $UI_CARD_SIDE "
+    printf '%s%s%s %s%s\n' "$indent" "$UI_CYAN" "$UI_ICON_NOTE" "$1" "$UI_RESET"
+}
 # <ok|no|warn> <text>
 ui_check() {
-    local state=$1 text=$2 mark=$UI_ICON_OK color=$UI_GREEN
+    local state=$1 text=$2 mark=$UI_ICON_OK color=$UI_GREEN indent='  '
     case $state in
         no) mark=$UI_ICON_NO; color=$UI_RED ;;
         warn) mark=$UI_ICON_WARN; color=$UI_YELLOW ;;
         info) mark=$UI_ICON_INFO; color='' ;;
     esac
-    printf '  %s%s%s %s\n' "$color" "$mark" "$UI_RESET" "$text"
+    (( UI_CARD )) && indent="  $UI_CARD_SIDE "
+    printf '%s%s%s%s %s\n' "$indent" "$color" "$mark" "$UI_RESET" "$text"
 }
 ui_plain_cc() {
     case ${1:-} in
@@ -626,7 +634,7 @@ ui_restart_expect() {
     qd=$(sed -n 's/^[[:space:]]*net\.core\.default_qdisc[[:space:]]*=[[:space:]]*//p' "$CONFIG" | tail -n 1)
     if [[ -z $cc && -z $qd ]]; then
         printf '配置文件存在，但内容无法识别'
-    elif [[ $cc == "${CURRENT_CC:-}" && $qd == "${CURRENT_QDISC:-}" ]]; then
+    elif [[ ( -z $cc || $cc == "${CURRENT_CC:-}" ) && ( -z $qd || $qd == "${CURRENT_QDISC:-}" ) ]]; then
         printf '和现在一致'
     else
         printf '重启后会变成算法 %s、队列 %s' "${cc:-保持默认}" "${qd:-保持默认}"
@@ -745,7 +753,6 @@ ui_run() {
 }
 ui_overview() {
     detect_system; detect_capabilities
-    ui_quick_facts
     say ''; ui_rule
     printf '%sBBR 管理工具 v%s%s\n' "$UI_BOLD" "$VERSION" "$UI_RESET"
     ui_card_begin '当前情况'
@@ -1478,7 +1485,7 @@ doctor() {
     show_status || rc=1
     say '开发/管理依赖：'
     for tool in sysctl flock ip tc modprobe python3; do
-        if has "$tool"; then ui_check ok "$tool：可用"; else ui_check no "$tool：缺少"; fi
+        if has "$tool"; then ui_check ok "$tool：可用"; else warn "缺少 $tool"; fi
     done
     probe_tcp || rc=1
     if has ss; then say '现有 TCP 连接（算法与统计由 ss 输出）：'; ss -tin || rc=1; fi
