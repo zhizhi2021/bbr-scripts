@@ -215,9 +215,6 @@ show_status() {
             fi
         else say '  实际网卡队列：无法读取'; rc=1; fi
     else fail '缺少 tc（iproute2），无法检查实际网卡队列。'; rc=1; fi
-    if (( $(ui_dw '  生效说明：新连接才生效；已有连接需要重连。') <= $(ui_width) )); then
-        say '  生效说明：新连接才生效；已有连接需要重连。'
-    else say '  生效说明：新连接才生效，重连后生效。'; fi
     if [[ -z $AVAILABLE || -z $CURRENT_CC || -z $CURRENT_QDISC ]]; then warn '运行参数读取不完整。'; rc=1; fi
     return "$rc"
 }
@@ -445,8 +442,6 @@ if sys.argv[1]=="full":
  qb=d["queue_budget_bytes"]
  print("  队列预算：%.2f MiB（上限 32 MiB）"%(qb/1048576.0))
 for n in d["notes"]:print("  提示："+n)
-if sys.argv[1]=="full":
- print("  设备资源不能推算线路带宽或 RTT")
 sys.exit(not d["complete"])' "$detail" "$UI_BAR_ON" "$UI_BAR_OFF" "$(ui_width)" "$UI_GREEN" "$UI_YELLOW" "$UI_RED" "$UI_RESET" <<< "$json" || return 1
     if [[ -n $IFACE ]] && has ip; then ip -o link show dev "$IFACE" || return 1; fi
 }
