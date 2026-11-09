@@ -3,7 +3,7 @@
 # Algorithm references: https://github.com/google/bbr
 # No remote shell execution or kernel removal. Kernel install can reboot.
 
-VERSION=1.2.2
+VERSION=1.3.0
 STATE_DIR=/var/lib/bbr-script
 CONFIG=/etc/sysctl.d/99-zz-bbr-script.conf
 LOG=$STATE_DIR/bbr-script.log
@@ -17,6 +17,11 @@ TX_ACTIVE=0 TX_DIR=''
 AUTO=0 SUITE=0 QUEUE_EXPLICIT=0 STREAMS_EXPLICIT=0 ALGORITHM_EXPLICIT=0
 BEFORE='' AFTER='' DEVICE_JSON='' DEVICE_QUEUE=fq DEVICE_BUDGET=0 DEVICE_STREAMS=1
 BENCH_INTERRUPTED=0
+# Visual vocabulary; ui_init() upgrades these to box glyphs on a terminal.
+# Piped or dumb output keeps the plain ASCII forms.
+UI_CARD=0 QUICK_CPUS='' QUICK_MEM_KB=''
+UI_BAR_ON='#' UI_BAR_OFF='-' UI_ICON_OK='[OK]' UI_ICON_NO='[NG]' UI_ICON_WARN='[!]'
+UI_ICON_NOTE='>' UI_ICON_INFO='-' UI_SEP='|' UI_CARD_TOP='+-' UI_CARD_SIDE='|' UI_CARD_BOTTOM='+-'
 
 say() { printf '%s\n' "$*"; }
 warn() { printf '提示：%s\n' "$*" >&2; }
@@ -180,18 +185,25 @@ detect_capabilities() {
     CURRENT_QDISC=$(sys_value net.core.default_qdisc || :)
 }
 inspect_qdiscs() {
-    if has tc; then tc -s qdisc show; else fail '缺少 tc（iproute2），无法检查实际网卡队列。'; return 1; fi
+    if has tc; then tc qdisc show; else fail '缺少 tc（iproute2），无法检查实际网卡队列。'; return 1; fi
 }
 show_status() {
     local rc=0
     detect_system; detect_capabilities
-    ui_heading "系统状态 · v$VERSION"
+    ui_quick_facts
+    ui_heading "系统状态 $UI_SEP v$VERSION"
+    ui_card_begin '一眼看懂'
+    ui_field '这台机器' "$(ui_plain_os) $UI_SEP ${QUICK_CPUS:-?} 核 / $(ui_plain_memory)"
+    ui_field '现在' "加速 $(ui_plain_cc "${CURRENT_CC:-}") $UI_SEP 排队 ${CURRENT_QDISC:-未知}"
+    ui_field '重启以后' "$(ui_restart_expect)"
+    ui_card_end
+    ui_note '只影响新连接；已有连接要重连。'
+    ui_heading '运行参数（原始读数，排障用）'
     ui_field '系统' "$OS_ID $OS_VERSION / $ARCH"
     ui_field '虚拟化' "$VIRT"
     ui_field '内核' "$(uname -r)"
     if (( SUPPORTED )); then ui_field '适配名单' '匹配（仍需运行能力检查）'
     else ui_field '适配名单' '未匹配（支持诊断与预演）'; fi
-    ui_heading '运行参数'
     ui_field '可用算法' "${AVAILABLE:-无法读取}"
     ui_field '默认算法' "${CURRENT_CC:-无法读取}"
     ui_field '默认队列' "${CURRENT_QDISC:-无法读取}"
@@ -200,14 +212,15 @@ show_status() {
     if [[ -r $CONFIG ]]; then ui_field '文件' "$CONFIG"; cat -- "$CONFIG" || rc=1
     elif [[ -e $CONFIG || -L $CONFIG ]]; then ui_field '状态' '存在，但无读取权限或链接不可用'; rc=1
     else ui_field '状态' '未由本脚本管理'; fi
-    if [[ -z $AVAILABLE || -z $CURRENT_CC || -z $CURRENT_QDISC ]]; then warn '运行参数读取不完整，不能确认配置状态。'; rc=1; fi
+    if [[ -z $AVAILABLE || -z $CURRENT_CC || -z $CURRENT_QDISC ]]; then warn '运行参数读取不完整。'; rc=1; fi
     ui_heading '实际网卡队列'
     inspect_qdiscs || rc=1
+    ui_note '要看丢包/超限计数：tc -s qdisc show'
     ui_heading '生效说明'
     say '  新建 socket 才采用新的默认算法。'
     say '  已有监听 socket 可能继续继承旧值。'
-    say '  名单核对：2026-11-07；匹配不代表真机验证。'
-    [[ $VIRT == container* ]] && warn '容器内可见值不代表宿主机可由本脚本管理。'
+    say '  名单核对 2026-11-07；不代表真机验证。'
+    [[ $VIRT == container* ]] && warn '容器内读数不代表宿主机状态。'
     return "$rc"
 }
 confirm() {
@@ -401,21 +414,40 @@ show_device_profile() {
     local json detail=${1:-full}
     json=$(hardware_snapshot) || return 1
     ui_heading '设备资源'
-    python3 -c 'import json,sys; d=json.load(sys.stdin)
-print("  CPU：%g 核有效 / %s 核可见"%(d["effective_cpus"],d["logical_cpus"]))
-print("  内存：%.1f MiB 有效 / %.1f MiB 可用"%(d["memory_limit_bytes"]/1048576,d["memory_available_bytes"]/1048576))
+    python3 -c 'import json,sys
+d=json.load(sys.stdin)
+on=sys.argv[2] if len(sys.argv)>2 else "#"
+off=sys.argv[3] if len(sys.argv)>3 else "-"
+cols=int(sys.argv[4]) if len(sys.argv)>4 else 64
+bw=max(8,min(18,cols-30))
+def bar(cur,mx,width=0):
+    width=width or bw
+    try:n=int(float(cur)*width/float(mx))
+    except (TypeError,ValueError,ZeroDivisionError):return off*width
+    n=max(0,min(width,n))
+    return on*n+off*(width-n)
+eff=d["effective_cpus"];log=d["logical_cpus"]
+me=d["memory_limit_bytes"];ma=d["memory_available_bytes"]
+pct=(100.0*ma/me) if me else 0
+mem="%.1f / %.1f GiB"%(ma/1073741824.0,me/1073741824.0)
+if cols>=50:mem+="（可用 %.0f%%）"%pct
+print("  CPU：%s  %g / %s 核"%(bar(eff,log),eff,log))
+print("  内存：%s  %s"%(bar(ma,me),mem))
 print("  建议队列：%s"%d["recommended_qdisc"])
 print("  测试并发：单流 1 / 压力 %s 流"%d["pressure_streams"])
 for n in d["notes"]:print("  提示："+n)
 if sys.argv[1]=="full":
- print("  队列预算：%.2f MiB"%(d["queue_budget_bytes"]/1048576))
+ qb=d["queue_budget_bytes"]
+ qtail="%.2f MiB（上限 32 MiB）"%(qb/1048576.0) if cols>=50 else "%.2f MiB"%(qb/1048576.0)
+ print("  队列预算：%s  %s"%(bar(qb,32*1024**2),qtail))
  print("")
- print("说明")
- print("  CPU 与内存已考虑亲和性及配额限制。")
- print("  fq 按 4 KiB/包估算，预算不是严格内存上限。")
- print("  fq_codel/cake 可限制队列内存。")
- print("  设备资源不能推算线路带宽、RTT 或最优 TCP 缓冲区。")
-sys.exit(not d["complete"])' "$detail" <<< "$json" || return 1
+ print("  说明（说人话）")
+ print("    CPU 和内存只用来挑建议值。")
+ print("    已考虑亲和性与 cgroup 配额。")
+ print("    fq 的包数按 4 KiB/包估算。")
+ print("    fq_codel/cake 可限制内存。")
+ print("    设备资源不能推算线路带宽或 RTT。")
+sys.exit(not d["complete"])' "$detail" "$UI_BAR_ON" "$UI_BAR_OFF" "$(ui_width)" <<< "$json" || return 1
     if [[ -n $IFACE ]] && has ip; then ip -o link show dev "$IFACE" || return 1; fi
 }
 show_change_plan() {
@@ -423,19 +455,23 @@ show_change_plan() {
     apply_device_defaults || return 1
     detect_capabilities
     ui_heading '配置变更'
+    ui_card_begin '要改什么'
     ui_change '新连接算法' "${CURRENT_CC:-}" bbr
     ui_change '默认队列' "${CURRENT_QDISC:-}" "$QUEUE"
     (( ! QUEUE_EXPLICIT )) || ui_field '队列来源' '手动指定（优先于设备建议）'
     ui_field '实际网卡队列' '本次不替换'
+    ui_card_end
+    ui_note '只改“以后新建连接”的默认值。'
     ui_heading '执行范围'
-    say '  设置新连接默认算法和默认队列。'
-    say '  保留 TCP 缓冲区、连接数与当前内核，不自动重启。'
-    say '  已有监听 socket 可能继续使用旧算法。'
+    ui_check ok '会改：新连接的加速算法与排队方式'
+    ui_check ok '会写：配置文件与原始备份'
+    ui_check info '不会动：缓冲区、连接数、内核'
+    ui_note '执行前会显示计划并等你确认。'
     if (( AUTO )); then
         ui_heading '网卡队列预算（本次不应用）'
-        ui_field '预算字节数' "$DEVICE_BUDGET"
-        say '  仅 queue --auto 更换网卡队列时使用。'
-        say '  fq 为包数估算；fq_codel/cake 可限制内存。'
+        ui_field '预算字节数' "$(awk -v b="$DEVICE_BUDGET" 'BEGIN{printf "%.2f MiB（%d 字节）", b/1048576, b}')"
+        ui_note '只在 queue --auto 时使用这个预算。'
+        ui_note 'fq 按包数估算；cake 可限制内存。'
     fi
     ui_heading '配置与恢复'
     ui_field '配置文件' "$CONFIG"
@@ -454,25 +490,31 @@ show_queue_plan() {
 recovery_center() {
     say '恢复与排障中心（只读）'
     say "状态目录：$STATE_DIR"
-    say "日志位置：$LOG（本命令不自动输出日志内容）"
+    ui_field '日志位置' "$LOG"
+    ui_note '本命令不自动输出日志内容'
     if [[ -d $STATE_DIR && ! -x $STATE_DIR ]]; then fail '当前用户无读取权限，请以 root 查看恢复记录。'; return 1; fi
     local pending=0
-    if [[ -d $STATE_DIR/transaction ]]; then say '配置事务未完成：bash bbr.sh restore'; pending=1; fi
+    ui_card_begin '检查结果'
+    if [[ -d $STATE_DIR/transaction ]]; then ui_check warn '配置事务未完成：bash bbr.sh restore'; pending=1; fi
     if [[ -d $STATE_DIR/kernel.pending ]]; then
-        if [[ -f $STATE_DIR/kernel.pending/target-version ]]; then say '内核切换待确认：bash bbr.sh kernel verify（回退用 kernel recover）'
-        else say '内核事务未完成：bash bbr.sh kernel recover'; fi
+        if [[ -f $STATE_DIR/kernel.pending/target-version ]]; then ui_check warn '内核切换待确认：bash bbr.sh kernel verify（回退用 kernel recover）'
+        else ui_check warn '内核事务未完成：bash bbr.sh kernel recover'; fi
         pending=1
     fi
-    [[ ! -d $STATE_DIR/kernel-switched ]] || say '已保留内核切换恢复记录：bash bbr.sh kernel recover'
-    if [[ -d $STATE_DIR/queue.pending ]]; then say '队列事务未完成：bash bbr.sh queue-restore'; pending=1; fi
-    (( pending )) || say '没有未完成事务。'
+    [[ ! -d $STATE_DIR/kernel-switched ]] || ui_check ok '已保留内核切换恢复记录：bash bbr.sh kernel recover'
+    if [[ -d $STATE_DIR/queue.pending ]]; then ui_check warn '队列事务未完成：bash bbr.sh queue-restore'; pending=1; fi
+    (( pending )) || ui_check ok '没有未完成事务。'
     if [[ -d $STATE_DIR/baseline ]]; then
-        if valid_snapshot "$STATE_DIR/baseline"; then say '原始配置备份有效：bash bbr.sh restore'
-        else fail '原始备份不完整，请核对历史快照，勿盲目覆盖。'; return 1; fi
+        if valid_snapshot "$STATE_DIR/baseline"; then ui_check ok '原始配置备份有效：bash bbr.sh restore'
+        else ui_card_end; fail '原始备份不完整，请核对历史快照，勿盲目覆盖。'; return 1; fi
     fi
-    [[ ! -d $STATE_DIR/queue-state ]] || say '存在队列恢复快照：bash bbr.sh queue-restore'
-    say '历史记录保留在状态目录的 *-history.* / *-restored.* 下；不会自动选择旧记录覆盖当前配置。'
-    say '恢复前仍会核对后续人工修改；换内核中断后先确认启动项，再决定是否重启。'
+    [[ ! -d $STATE_DIR/queue-state ]] || ui_check ok '存在队列恢复快照：bash bbr.sh queue-restore'
+    ui_card_end
+    ui_note '历史记录在状态目录下'
+    ui_note '*-history.* / *-restored.*'
+    ui_note '不会用旧记录覆盖当前配置。'
+    ui_note '恢复前会核对人工修改。'
+    ui_note '换内核中断时先确认启动项。'
 }
 ui_device_menu() {
     local AUTO=1 QUEUE=$QUEUE QUEUE_EXPLICIT=$QUEUE_EXPLICIT
@@ -495,6 +537,11 @@ UI_BOLD='' UI_CYAN='' UI_GREEN='' UI_YELLOW='' UI_RED='' UI_RESET=''
 UI_INPUT=''
 ui_init() {
     UI_BOLD='' UI_CYAN='' UI_GREEN='' UI_YELLOW='' UI_RED='' UI_RESET=''
+    UI_CARD=0
+    if [[ ${TERM:-dumb} != dumb ]]; then
+        UI_BAR_ON='█' UI_BAR_OFF='░' UI_ICON_OK='✓' UI_ICON_NO='✗'
+        UI_ICON_WARN='!' UI_ICON_NOTE='▸' UI_ICON_INFO='·' UI_SEP='·' UI_CARD_TOP='┌─' UI_CARD_SIDE='│' UI_CARD_BOTTOM='└─'
+    fi
     if [[ -t 1 && ${TERM:-dumb} != dumb && -z ${NO_COLOR+x} ]]; then
         UI_BOLD=$'\033[1m'; UI_CYAN=$'\033[36m'; UI_GREEN=$'\033[32m'
         UI_YELLOW=$'\033[33m'; UI_RED=$'\033[31m'; UI_RESET=$'\033[0m'
@@ -514,12 +561,84 @@ ui_rule() {
     printf '%s%s%s\n' "$UI_CYAN" "${line// /$mark}" "$UI_RESET"
 }
 ui_heading() { printf '\n%s[%s]%s\n' "$UI_BOLD" "$1" "$UI_RESET"; }
+# <title> [title display width, default 8 for four CJK glyphs]
+ui_card_begin() {
+    local title=$1 dw=${2:-8} line
+    printf -v line '%*s' "$(( $(ui_width) - 6 - dw ))" ''
+    (( ${#line} >= 2 )) || line='  '
+    printf '\n  %s%s %s %s%s\n' "$UI_CYAN" "$UI_CARD_TOP" "$title" "${line// /-}" "$UI_RESET"
+    UI_CARD=1
+}
+ui_card_end() {
+    local line
+    printf -v line '%*s' "$(( $(ui_width) - 4 ))" ''
+    printf '  %s%s%s%s\n' "$UI_CYAN" "$UI_CARD_BOTTOM" "${line// /-}" "$UI_RESET"
+    UI_CARD=0
+}
+ui_note() { printf '  %s%s %s%s\n' "$UI_CYAN" "$UI_ICON_NOTE" "$1" "$UI_RESET"; }
+# <ok|no|warn> <text>
+ui_check() {
+    local state=$1 text=$2 mark=$UI_ICON_OK color=$UI_GREEN
+    case $state in
+        no) mark=$UI_ICON_NO; color=$UI_RED ;;
+        warn) mark=$UI_ICON_WARN; color=$UI_YELLOW ;;
+        info) mark=$UI_ICON_INFO; color='' ;;
+    esac
+    printf '  %s%s%s %s\n' "$color" "$mark" "$UI_RESET" "$text"
+}
+ui_plain_cc() {
+    case ${1:-} in
+        '') printf '无法读取' ;;
+        bbr) printf '已开启（bbr）' ;;
+        *) printf '未开启（%s）' "$1" ;;
+    esac
+}
+ui_plain_os() {
+    local name version
+    if (( $(ui_width) < 50 )); then printf '%s %s' "$OS_ID" "$OS_VERSION"; return 0; fi
+    name=$(read_os_field NAME 2>/dev/null || :)
+    version=$(read_os_field VERSION_ID 2>/dev/null || :)
+    if [[ -n $name && -n $version ]]; then printf '%s %s' "$name" "$version"
+    else printf '%s %s' "$OS_ID" "$OS_VERSION"; fi
+}
+ui_quick_facts() {
+    QUICK_CPUS=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null || :)
+    QUICK_MEM_KB=$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null || :)
+    [[ $QUICK_CPUS =~ ^[0-9]+$ ]] && (( QUICK_CPUS > 0 )) || QUICK_CPUS=''
+    [[ $QUICK_MEM_KB =~ ^[0-9]+$ ]] && (( QUICK_MEM_KB > 0 )) || QUICK_MEM_KB=''
+}
+ui_plain_memory() {
+    if [[ -n $QUICK_MEM_KB ]]; then
+        awk -v kb="$QUICK_MEM_KB" 'BEGIN{printf "%.1f GiB", kb/1048576}'
+    else printf '内存未知'; fi
+}
+# Plain-language answer to "will this survive a reboot?", read back from the
+# managed file instead of assuming enable's target values.
+ui_restart_expect() {
+    local cc qd
+    if [[ ! -e $CONFIG && ! -L $CONFIG ]]; then
+        printf '不受本脚本管理（沿用系统设置）'; return 0
+    fi
+    if [[ ! -r $CONFIG ]]; then
+        printf '无法确认（读取配置文件需要 root）'; return 0
+    fi
+    cc=$(sed -n 's/^[[:space:]]*net\.ipv4\.tcp_congestion_control[[:space:]]*=[[:space:]]*//p' "$CONFIG" | tail -n 1)
+    qd=$(sed -n 's/^[[:space:]]*net\.core\.default_qdisc[[:space:]]*=[[:space:]]*//p' "$CONFIG" | tail -n 1)
+    if [[ -z $cc && -z $qd ]]; then
+        printf '配置文件存在，但内容无法识别'
+    elif [[ $cc == "${CURRENT_CC:-}" && $qd == "${CURRENT_QDISC:-}" ]]; then
+        printf '和现在一致'
+    else
+        printf '重启后会变成算法 %s、队列 %s' "${cc:-保持默认}" "${qd:-保持默认}"
+    fi
+}
 ui_field() {
-    local label=$1 value=$2
+    local label=$1 value=$2 indent='  '
+    (( UI_CARD )) && indent="  $UI_CARD_SIDE "
     # Stack long values on narrow terminals; avoid CJK column padding.
     if (( $(ui_width) < 50 && ${#value} > 22 )); then
-        printf '  %s：\n    %s\n' "$label" "$value"
-    else printf '  %s：%s\n' "$label" "$value"; fi
+        printf '%s%s：\n%s  %s\n' "$indent" "$label" "$indent" "$value"
+    else printf '%s%s：%s\n' "$indent" "$label" "$value"; fi
 }
 ui_banner() {
     local status=$1 title=$2 color=$UI_GREEN
@@ -535,9 +654,12 @@ ui_change() {
     elif [[ $phase == actual ]]; then mark=已修改; color=$UI_GREEN
     elif [[ $phase == observed ]]; then mark=检测到变化
     else mark=将修改; fi
-    printf '  %s[%s]%s %s\n' "$color" "$mark" "$UI_RESET" "$label"
-    if [[ -n $before && $before == "$after" ]]; then printf '    %s\n' "$after"
-    else printf '    %s → %s\n' "${before:-无法读取}" "${after:-无法读取}"; fi
+    local indent='  '
+    (( UI_CARD )) && indent="  $UI_CARD_SIDE "
+    printf '%s%s[%s]%s %s\n' "$indent" "$color" "$mark" "$UI_RESET" "$label"
+    local vline="${indent}  "
+    if [[ -n $before && $before == "$after" ]]; then printf '%s%s\n' "$vline" "$after"
+    else printf '%s%s → %s\n' "$vline" "${before:-无法读取}" "${after:-无法读取}"; fi
 }
 config_result() {
     local title=$1 before_cc=$2 before_qd=$3 target_cc=$4 target_qd=$5 mode=${6:-changed}
@@ -546,16 +668,20 @@ config_result() {
     after_qd=$(sys_value net.core.default_qdisc) || after_qd=''
     if [[ $after_cc != "$target_cc" || $after_qd != "$target_qd" ]]; then
         ui_banner '校验不完整' "$title"
+        ui_card_begin '实际结果'
         ui_change '默认 TCP' "$before_cc" "$after_cc" observed
         ui_change '默认队列' "$before_qd" "$after_qd" observed
-        warn '最终运行值与目标不一致或无法读取；请检查状态及恢复记录。'
+        ui_card_end
+        ui_check no '运行值和目标不一致或读不到；请先看“状态”，再决定是否恢复。'
         return 1
     fi
     if [[ $mode == unchanged ]]; then ui_banner '无需修改' "$title"
     else ui_banner '执行成功' "$title"; fi
+    ui_card_begin '实际结果'
     ui_change '默认 TCP' "$before_cc" "$after_cc" actual
     ui_change '默认队列' "$before_qd" "$after_qd" actual
-    say '  [已校验] 以上为操作后实际读取的运行值。'
+    ui_card_end
+    ui_check ok '以上为操作后重新读到的运行值，已核对一致。'
     if [[ -r $CONFIG ]]; then
         case $mode in
             unchanged) ui_field '[保持不变] 配置文件' "$CONFIG" ;;
@@ -619,14 +745,18 @@ ui_run() {
 }
 ui_overview() {
     detect_system; detect_capabilities
+    ui_quick_facts
     say ''; ui_rule
     printf '%sBBR 管理工具 v%s%s\n' "$UI_BOLD" "$VERSION" "$UI_RESET"
+    ui_card_begin '当前情况'
     ui_field '系统' "$OS_ID $OS_VERSION / $ARCH"
     ui_field '内核' "$(uname -r)"
-    ui_field '默认 TCP' "${CURRENT_CC:-未知}"
+    ui_field '默认 TCP' "$(ui_plain_cc "${CURRENT_CC:-}")"
     ui_field '默认队列' "${CURRENT_QDISC:-未知}"
+    ui_card_end
+    ui_note '默认 TCP=加速算法，队列=排队方式'
     if (( DRY_RUN )); then say '运行模式：预演，不修改系统、不发起测速'
-    elif [[ $VIRT == container* ]]; then say '运行模式：容器，不能修改系统；可诊断、预演和测速'
+    elif [[ $VIRT == container* ]]; then say '运行模式：容器，只读（可预演/测速）'
     elif (( ! SUPPORTED )); then say '运行模式：此系统不在适配名单；可诊断、预演和测速'
     elif (( EUID != 0 )); then say '当前权限：普通用户；系统修改需以 root 重新运行'
     else say '当前权限：root；修改前会显示说明并确认'; fi
@@ -1348,7 +1478,7 @@ doctor() {
     show_status || rc=1
     say '开发/管理依赖：'
     for tool in sysctl flock ip tc modprobe python3; do
-        if has "$tool"; then say "  $tool: 可用"; else warn "缺少 $tool"; fi
+        if has "$tool"; then ui_check ok "$tool：可用"; else ui_check no "$tool：缺少"; fi
     done
     probe_tcp || rc=1
     if has ss; then say '现有 TCP 连接（算法与统计由 ss 输出）：'; ss -tin || rc=1; fi
@@ -2463,7 +2593,7 @@ run_benchmark() {
 benchmark_compare() {
     [[ -n $BEFORE && -n $AFTER ]] || { fail '需要 --before 与 --after 两个保存的测速目录'; return 2; }
     has python3 || { fail '结果比较需要 python3'; return 1; }
-    python3 - "$BEFORE" "$AFTER" <<'PY'
+    python3 - "$BEFORE" "$AFTER" "$UI_BAR_ON" "$UI_BAR_OFF" <<'PY'
 import json,pathlib,re,sys,math
 
 def conditions(path):
@@ -2498,7 +2628,7 @@ def metric(path,algo,allow_fallback=False):
     if cc is not None and (not isinstance(cc,str) or not re.fullmatch(r'[A-Za-z0-9_]{1,32}',cc)):raise ValueError('实测算法报告无效')
     return rate,retries,(sum(rtts)/len(rtts) if rtts else None),cc
 try:
-    before,after=map(pathlib.Path,sys.argv[1:]);a=conditions(before);b=conditions(after)
+    before,after=map(pathlib.Path,sys.argv[1:3]);a=conditions(before);b=conditions(after)
     for key in ('host','port','duration','parallel','reverse','compare'):
         if key not in a or key not in b or a[key]!=b[key]:raise ValueError('条件不一致或缺失：'+key)
     # --algorithm only selects the tested socket's algorithm: --reverse leaves
@@ -2522,6 +2652,12 @@ try:
         delta='%+.1f%%'%((y[0]/x[0]-1)*100) if x[0] else '不可计算（原吞吐为 0）'
         fmt=lambda v:'未知' if v is None else (('%d'%v) if type(v) is int else ('%.3f'%v))
         print('%s：吞吐 %.3f → %.3f Mbps（%s）'%(algo,x[0]/1e6,y[0]/1e6,delta))
+        peak=max(x[0],y[0]) or 1.0
+        def _bar(v,width=18):
+            n=max(0,min(width,int(v*width/peak)))
+            return sys.argv[3]*n+sys.argv[4]*(width-n)
+        print('    优化前 %s  %8.2f Mbps'%(_bar(x[0]),x[0]/1e6))
+        print('    优化后 %s  %8.2f Mbps'%(_bar(y[0]),y[0]/1e6))
         print('  实测发送端算法 %s → %s'%(x[3] or '未知',y[3] or '未知'))
         print('  重传 %s → %s；各流平均 RTT 的均值 %s → %s ms'%(fmt(x[1]),fmt(y[1]),fmt(x[2]),fmt(y[2])))
     print('这只是两次相同记录条件的观测；链路变化、测试顺序和服务端状态可能影响结果，不自动宣称提速。')
